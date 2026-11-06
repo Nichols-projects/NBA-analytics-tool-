@@ -1,0 +1,844 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>DK Analytics Terminal — NBA Prop Engine</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = { theme: { extend: {
+    colors: { neon: '#39ff88', miss: '#ef4444' },
+    fontFamily: { sans: ['Inter','system-ui','sans-serif'], mono: ['JetBrains Mono','ui-monospace','monospace'] }
+  } } };
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  body { background:#0b1120; }
+  .card { background: rgba(15,23,42,.88); border:1px solid rgba(51,65,85,.7); border-radius: 14px; }
+  .glow { box-shadow: 0 0 0 1px rgba(57,255,136,.25), 0 0 24px -6px rgba(57,255,136,.35); }
+  .pill { display:inline-flex; align-items:center; justify-content:center; padding:2px 9px; border-radius:999px; font-weight:700; font-size:12px; font-family:'JetBrains Mono',monospace; white-space:nowrap; }
+  .pill-hit,.pill-fav { background: rgba(57,255,136,.14); color:#39ff88; border:1px solid rgba(57,255,136,.45); }
+  .pill-miss,.pill-tough { background: rgba(239,68,68,.14); color:#f87171; border:1px solid rgba(239,68,68,.5); }
+  .pill-neut { background: rgba(234,179,8,.14); color:#facc15; border:1px solid rgba(234,179,8,.5); }
+  .pill-dim { background: rgba(100,116,139,.15); color:#94a3b8; border:1px solid rgba(100,116,139,.4); }
+  .tab { transition: all .15s ease; }
+  .tab.active { background:#39ff88; color:#04120a; box-shadow:0 0 18px -4px rgba(57,255,136,.7); }
+  .scroll-thin::-webkit-scrollbar { height:6px; width:6px; }
+  .scroll-thin::-webkit-scrollbar-thumb { background:#334155; border-radius:6px; }
+  .fade-in { animation: fade .25s ease; }
+  @keyframes fade { from { opacity:.3; transform: translateY(3px);} to { opacity:1; transform:none; } }
+  .spin { width:14px; height:14px; border:2px solid #334155; border-top-color:#39ff88; border-radius:50%; animation: sp 0.8s linear infinite; display:inline-block; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+  .row-sel { background: rgba(57,255,136,.08); box-shadow: inset 3px 0 0 #39ff88; }
+  th.sortable { cursor:pointer; user-select:none; }
+  th.sortable:hover { color:#e2e8f0; }
+  input[type=date]::-webkit-calendar-picker-indicator { filter: invert(.8); }
+</style>
+</head>
+<body class="text-slate-200 font-sans min-h-screen bg-slate-900">
+
+<header class="sticky top-0 z-30 bg-slate-950/90 backdrop-blur border-b border-slate-800">
+  <div class="max-w-[1500px] mx-auto px-4 py-3 flex flex-col md:flex-row md:items-center gap-3">
+    <div class="flex items-center gap-3 shrink-0">
+      <div class="w-9 h-9 rounded-lg bg-neon/15 border border-neon/40 grid place-items-center text-neon font-mono font-bold">DK</div>
+      <div>
+        <h1 class="text-base sm:text-lg font-extrabold tracking-tight leading-none">DK Analytics Terminal <span class="text-slate-500 font-medium">— NBA Prop Engine</span></h1>
+        <div id="statusLine" class="text-[11px] text-slate-500 font-mono mt-1 flex items-center gap-2"><span class="spin"></span> Connecting to live feed…</div>
+      </div>
+    </div>
+    <div class="md:ml-auto flex items-center gap-2 w-full md:w-auto">
+      <input id="datePick" type="date" class="bg-slate-900 border border-slate-700 rounded-lg px-2 py-2 text-sm font-mono outline-none focus:border-neon/60" />
+      <button id="refreshBtn" title="Refresh lines" class="shrink-0 bg-slate-900 border border-slate-700 hover:border-neon/60 rounded-lg px-3 py-2 text-sm font-semibold">↻ Refresh</button>
+      <div class="relative flex-1 md:w-80">
+        <svg class="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+        <input id="search" autocomplete="off" placeholder="Search tonight's players…"
+          class="w-full bg-slate-900 border border-slate-700 focus:border-neon/60 focus:ring-2 focus:ring-neon/20 outline-none rounded-lg pl-9 pr-3 py-2 text-sm placeholder:text-slate-500" />
+        <ul id="dropdown" class="hidden absolute mt-1 w-full card overflow-y-auto max-h-80 scroll-thin shadow-2xl z-40"></ul>
+      </div>
+    </div>
+  </div>
+  <div class="max-w-[1500px] mx-auto px-4 pb-3 flex flex-col lg:flex-row lg:items-center gap-3">
+    <div id="gameChips" class="flex gap-2 overflow-x-auto scroll-thin pb-1"></div>
+    <div id="marketTabs" class="lg:ml-auto flex gap-1 bg-slate-900 border border-slate-800 rounded-lg p-1 overflow-x-auto scroll-thin shrink-0"></div>
+  </div>
+</header>
+
+<main class="max-w-[1500px] mx-auto px-4 py-5">
+  <div id="notice" class="hidden card p-4 mb-5 text-sm"></div>
+  <div class="grid grid-cols-1 xl:grid-cols-12 gap-5">
+
+    <!-- PROP BOARD -->
+    <aside class="xl:col-span-4">
+      <div class="card p-4 xl:sticky xl:top-[132px]">
+        <div class="flex items-center justify-between mb-3 gap-2">
+          <h3 class="font-bold text-sm uppercase tracking-wider text-slate-400">Prop Board <span id="boardCount" class="text-slate-600 normal-case tracking-normal font-mono"></span></h3>
+          <select id="boardSort" class="bg-slate-900 border border-slate-700 rounded-md text-xs px-2 py-1 outline-none">
+            <option value="edge">Sort: Edge vs price</option>
+            <option value="l10">Sort: L10 hit %</option>
+            <option value="season">Sort: Season hit %</option>
+            <option value="line">Sort: Line</option>
+          </select>
+        </div>
+        <div class="overflow-y-auto scroll-thin max-h-[420px] xl:max-h-[calc(100vh-230px)]">
+          <table class="w-full text-sm">
+            <thead class="sticky top-0 bg-slate-900 z-10">
+              <tr class="text-left text-[10px] uppercase tracking-wider text-slate-500 border-b border-slate-800">
+                <th class="py-2 pr-2">Player</th><th class="py-2 pr-2">Line</th><th class="py-2 pr-2 text-center">L5</th><th class="py-2 pr-2 text-center">L10</th><th class="py-2 pr-2 text-center">Szn</th><th class="py-2 text-right">Edge</th>
+              </tr>
+            </thead>
+            <tbody id="boardBody"></tbody>
+          </table>
+        </div>
+        <p class="text-[10px] text-slate-500 mt-3 leading-relaxed">Hit % = how often he cleared <b>tonight's</b> DK line in past games. Edge = L10 hit % minus DK's no-vig Over probability. Green = leans Over, red = leans Under.</p>
+      </div>
+    </aside>
+
+    <!-- DETAIL -->
+    <section id="detail" class="xl:col-span-8 space-y-5">
+      <div class="card p-10 text-center text-slate-500"><span class="spin"></span><div class="mt-3 text-sm">Loading tonight's slate…</div></div>
+    </section>
+  </div>
+
+  <footer class="text-center text-[11px] text-slate-600 py-6 leading-relaxed">
+    Live data: ESPN public feeds (DraftKings is ESPN's odds provider). Not affiliated with DraftKings, ESPN or the NBA. Lines can move or be pulled at any time, so confirm in the DK app before betting.<br/>
+    For research and entertainment. Gambling problem? Call 1-800-GAMBLER.
+  </footer>
+</main>
+
+<script>
+// ===== CONFIG =====
+const ESPN = 'https://site.api.espn.com/apis/site/v2/sports/basketball/nba';
+const WEB  = 'https://site.web.api.espn.com/apis/common/v3/sports/basketball/nba';
+const CORE = 'https://sports.core.api.espn.com/v2/sports/basketball/leagues/nba';
+const DK_PROVIDER = 100; // DraftKings on ESPN
+
+const MARKETS = [
+  { key:'pts', label:'Points',   prop:'Total Points',                         alt:'Points Milestones',                     f:g=>g.pts },
+  { key:'reb', label:'Rebounds', prop:'Total Rebounds',                       alt:'Rebounds Milestones',                   f:g=>g.reb },
+  { key:'ast', label:'Assists',  prop:'Total Assists',                        alt:'Assists Milestones',                    f:g=>g.ast },
+  { key:'fg3', label:'Threes',   prop:'Total 3-Point Field Goals',            alt:'3-Point Field Goals Milestones',        f:g=>g.fg3 },
+  { key:'pra', label:'PRA',      prop:'Total Points, Rebounds, and Assists',  alt:'Points + Assists + Rebounds Milestones', f:g=>g.pts+g.reb+g.ast },
+  { key:'pr',  label:'P+R',      prop:'Total Points and Rebounds',            alt:'Points + Rebounds Milestones',          f:g=>g.pts+g.reb },
+  { key:'pa',  label:'P+A',      prop:'Total Points and Assists',             alt:'Points + Assists Milestones',           f:g=>g.pts+g.ast },
+  { key:'ra',  label:'R+A',      prop:'Total Assists and Rebounds',           alt:null,                                    f:g=>g.reb+g.ast },
+];
+const MK = Object.fromEntries(MARKETS.map(m=>[m.key,m]));
+
+// ===== STATE =====
+const S = {
+  date: null, season: null, games: [], gameFilter: 'all', market: 'pts',
+  playerId: null, players: {}, props: {}, logs: {}, defense: null,
+  sort: 'edge', logView: 'l10', customLine: {}, updatedAt: null, loadingSlate: false
+};
+
+// ===== HELPERS =====
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmtOdds = o => (o==null||isNaN(o)) ? '—' : (o>0 ? '+'+o : String(o));
+const implied = o => o<0 ? (-o)/((-o)+100) : 100/(o+100);
+const pct = (x,d=1) => (x==null||isNaN(x)) ? '—' : (x*100).toFixed(d)+'%';
+const fmtDate = dt => dt.toLocaleDateString('en-US',{month:'short',day:'numeric'});
+const fmtTime = dt => dt.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'});
+const ymd = d => d.getFullYear()+String(d.getMonth()+1).padStart(2,'0')+String(d.getDate()).padStart(2,'0');
+const isoDay = d => d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+const rankClass = r => r==null ? 'pill-dim' : r<=10 ? 'pill-tough' : r<=20 ? 'pill-neut' : 'pill-fav';
+const rankLabel = r => r==null ? '—' : r<=10 ? 'Tough' : r<=20 ? 'Neutral' : 'Favorable';
+const rankColor = r => r==null ? '#94a3b8' : r<=10 ? '#f87171' : r<=20 ? '#facc15' : '#39ff88';
+const ord = n => { const s=['th','st','nd','rd'], v=n%100; return n+(s[(v-20)%10]||s[v]||s[0]); };
+const avg = a => a.length ? a.reduce((s,x)=>s+x,0)/a.length : NaN;
+const lsGet = k => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : null; } catch(e){ return null; } };
+const lsSet = (k,v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch(e){} };
+
+async function getJSON(url){
+  const r = await fetch(url);
+  if(!r.ok) throw new Error(r.status+' '+url);
+  return r.json();
+}
+function limiter(n){
+  let active=0; const q=[];
+  const next=()=>{ if(active>=n||!q.length) return; active++; const {fn,res,rej}=q.shift();
+    Promise.resolve().then(fn).then(res,rej).finally(()=>{active--; next();}); };
+  return fn => new Promise((res,rej)=>{ q.push({fn,res,rej}); next(); });
+}
+const limit = limiter(8);
+
+let renderQueued = false;
+function scheduleRender(){ if(renderQueued) return; renderQueued = true; requestAnimationFrame(()=>{ renderQueued=false; renderAll(); }); }
+
+// ===== DATA: SLATE, ROSTERS, PROPS =====
+async function loadSlate(){
+  S.loadingSlate = true;
+  S.games = []; S.players = {}; S.props = {}; S.playerId = null; S.gameFilter = 'all';
+  setStatus('loading', 'Loading slate…');
+  renderAll();
+  let sb;
+  try { sb = await getJSON(`${ESPN}/scoreboard?dates=${S.date.replace(/-/g,'')}`); }
+  catch(e){ setStatus('error','Could not reach ESPN. Check your connection and hit Refresh.'); S.loadingSlate=false; renderAll(); return; }
+  S.season = sb.leagues?.[0]?.season?.year || S.season;
+  S.games = (sb.events||[]).map(e=>{
+    const c = e.competitions[0];
+    const side = ha => { const t = c.competitors.find(x=>x.homeAway===ha); return { id:t.team.id, abbr:t.team.abbreviation, name:t.team.displayName, short:t.team.name, logo:t.team.logo, record:t.records?.[0]?.summary }; };
+    return { id:e.id, date:new Date(e.date), short:e.shortName, status:e.status?.type||{}, home:side('home'), away:side('away'),
+             spread:c.odds?.[0]?.details, total:c.odds?.[0]?.overUnder, propsStatus:'loading' };
+  });
+  if(!S.games.length){ S.loadingSlate=false; setStatus('ok','No NBA games on this date'); renderAll(); return; }
+  if(!S.defense) loadDefense();
+  await Promise.all(S.games.map(g => Promise.all([loadRoster(g, g.home, g.away), loadRoster(g, g.away, g.home), loadProps(g)])));
+  S.loadingSlate = false;
+  S.updatedAt = new Date();
+  setStatus('ok');
+  // queue game logs for every player with a prop
+  Object.keys(S.props).forEach(id => loadLog(id));
+  if(!S.playerId){ const first = boardRows()[0]; if(first) selectPlayer(first.id, false); }
+  renderAll();
+}
+
+async function loadRoster(game, team, opp){
+  try{
+    const j = await getJSON(`${ESPN}/teams/${team.id}/roster`);
+    (j.athletes||[]).forEach(a=>{
+      const inj = (a.injuries||[])[0];
+      S.players[a.id] = { id:a.id, name:a.displayName||a.fullName, pos:a.position?.abbreviation||'', jersey:a.jersey||'',
+        headshot:a.headshot?.href||'', teamId:team.id, team:team.abbr, oppId:opp.id, opp:opp.abbr, gameId:game.id,
+        home: team.id===game.home.id, injury: inj ? (inj.status || inj.type?.description || 'Injured') : null,
+        injDetail: inj ? (inj.details?.detail || inj.shortComment || inj.longComment || '') : '' };
+    });
+  }catch(e){ console.warn('roster', team.abbr, e); }
+}
+
+async function loadProps(game){
+  const base = `${CORE}/events/${game.id}/competitions/${game.id}/odds/${DK_PROVIDER}/propBets?lang=en&region=us&limit=1000`;
+  let items = [];
+  try{
+    const first = await getJSON(base);
+    items = first.items || [];
+    for(let p=2; p<=(first.pageCount||1); p++){ const nx = await getJSON(base+'&page='+p); items = items.concat(nx.items||[]); }
+  }catch(e){ game.propsStatus = 'none'; return; }
+  const aid = i => i.athlete?.$ref?.match(/athletes\/(\d+)/)?.[1];
+  const groups = {};
+  items.forEach(i=>{ const a=aid(i); if(!a) return; (groups[(i.type?.name)+'|'+a] ??= []).push(i); });
+  let count = 0;
+  for(const m of MARKETS){
+    for(const [k,arr] of Object.entries(groups)){
+      const [type, a] = k.split('|');
+      if(type===m.prop && arr.length>=2){
+        // ESPN lists DK pairs Over first, Under second (verified against DK milestone prices)
+        const line = arr[0].current?.target?.value;
+        const under = arr.slice(1).find(x=>x.current?.target?.value===line) || arr[1];
+        const P = (S.props[a] ??= { gameId: game.id, markets:{}, alts:{} });
+        P.markets[m.key] = {
+          line, over:+arr[0].odds?.american?.value, under:+under.odds?.american?.value,
+          openLine: arr[0].open?.target?.value, openOver:+arr[0].odds?.american?.open, openUnder:+under.odds?.american?.open,
+          updated: arr[0].lastUpdated ? new Date(arr[0].lastUpdated) : null
+        };
+        count++;
+      }
+      if(m.alt && type===m.alt){
+        const P = (S.props[a] ??= { gameId: game.id, markets:{}, alts:{} });
+        P.alts[m.key] = arr.map(x=>({ t:x.current?.target?.value, odds:+x.odds?.american?.value }))
+                           .filter(x=>x.t!=null && !isNaN(x.odds)).sort((x,y)=>x.t-y.t);
+      }
+    }
+  }
+  game.propsStatus = count ? 'ok' : 'none';
+}
+
+// ===== DATA: GAME LOGS =====
+function parseLog(j, season){
+  if(!j?.names || !j.events) return [];
+  const N = j.names, ix = n => N.indexOf(n);
+  const sp = v => String(v||'0-0').split('-').map(Number);
+  const out = [];
+  for(const st of (j.seasonTypes||[])){
+    if(!/Regular Season/i.test(st.displayName||'')) continue;
+    for(const c of (st.categories||[])){
+      if(c.type!=='event') continue;
+      for(const ev of (c.events||[])){
+        const m = j.events[ev.eventId]; if(!m) continue;
+        const s = ev.stats||[];
+        const [fgm,fga] = sp(s[ix('fieldGoalsMade-fieldGoalsAttempted')]);
+        const [tpm,tpa] = sp(s[ix('threePointFieldGoalsMade-threePointFieldGoalsAttempted')]);
+        const [ftm,fta] = sp(s[ix('freeThrowsMade-freeThrowsAttempted')]);
+        const g = { id:ev.eventId, date:new Date(m.gameDate), season, opp:m.opponent?.abbreviation||'?', oppId:m.opponent?.id,
+          atVs:m.atVs||'vs', result:m.gameResult||'', score:m.score||'', min:+s[ix('minutes')]||0,
+          pts:+s[ix('points')]||0, reb:+s[ix('totalRebounds')]||0, ast:+s[ix('assists')]||0,
+          stl:+s[ix('steals')]||0, blk:+s[ix('blocks')]||0, tov:+s[ix('turnovers')]||0,
+          fgm, fga, fg3:tpm, fg3a:tpa, ftm, fta };
+        if(g.min>0) out.push(g);
+      }
+    }
+  }
+  return out;
+}
+
+function loadLog(id, priority=false){
+  let L = S.logs[id];
+  if(L && (L.started || !priority)) return L.promise;
+  if(!L){ L = S.logs[id] = { status:'loading', games:[], started:false }; }
+  const run = async () => {
+    if(L.started) return; L.started = true;
+    try{
+      const [cur, prev] = await Promise.all([
+        getJSON(`${WEB}/athletes/${id}/gamelog?season=${S.season}`).catch(()=>null),
+        getJSON(`${WEB}/athletes/${id}/gamelog?season=${S.season-1}`).catch(()=>null)
+      ]);
+      L.games = [...parseLog(cur,S.season), ...parseLog(prev,S.season-1)].sort((a,b)=>b.date-a.date);
+      L.status = 'ok';
+    }catch(e){ L.status = 'error'; }
+    scheduleRender();
+  };
+  L.promise = priority ? run() : limit(run);
+  return L.promise;
+}
+
+// ===== DATA: OPPONENT DEFENSE (computed from every box score this season) =====
+async function loadDefense(){
+  const today = new Date(S.date+'T12:00:00');
+  const start = new Date(S.season-1, 9, 1); // Oct 1 of season start year
+  const days = [];
+  for(let d=new Date(start); d<today; d.setDate(d.getDate()+1)) days.push(ymd(d));
+  const results = await Promise.all(days.map(day => limit(async ()=>{
+    const key = 'dkat-sb-'+day;
+    const cached = lsGet(key);
+    if(cached) return cached;
+    try{
+      const j = await getJSON(`${ESPN}/scoreboard?dates=${day}`);
+      const evs = (j.events||[]).filter(e=>e.season?.type===2 && e.status?.type?.completed).map(e=>({
+        teams: e.competitions[0].competitors.map(c=>{
+          const st = Object.fromEntries((c.statistics||[]).map(x=>[x.name, parseFloat(x.displayValue)]));
+          return { id:c.team.id, abbr:c.team.abbreviation, pts:+c.score||0, reb:st.rebounds||0, ast:st.assists||0,
+                   fg3:st.threePointFieldGoalsMade||0, fg3a:st.threePointFieldGoalsAttempted||0,
+                   fgm:st.fieldGoalsMade||0, fga:st.fieldGoalsAttempted||0 };
+        })
+      }));
+      const allDone = (j.events||[]).every(e=>e.status?.type?.completed);
+      if(allDone) lsSet(key, evs);
+      return evs;
+    }catch(e){ return []; }
+  })));
+  const T = {};
+  results.flat().forEach(ev=>{
+    if(ev.teams.length!==2) return;
+    [[0,1],[1,0]].forEach(([a,b])=>{
+      const me = ev.teams[a], op = ev.teams[b];
+      const t = (T[me.id] ??= { id:me.id, abbr:me.abbr, gp:0, pts:0, reb:0, ast:0, fg3:0, fg3a:0, fgm:0, fga:0 });
+      t.gp++; ['pts','reb','ast','fg3','fg3a','fgm','fga'].forEach(k=>t[k]+=op[k]);
+    });
+  });
+  const teams = Object.values(T).filter(t=>t.gp>0);
+  const metrics = {
+    pts:t=>t.pts/t.gp, reb:t=>t.reb/t.gp, ast:t=>t.ast/t.gp, fg3:t=>t.fg3/t.gp,
+    pra:t=>(t.pts+t.reb+t.ast)/t.gp, pr:t=>(t.pts+t.reb)/t.gp, pa:t=>(t.pts+t.ast)/t.gp, ra:t=>(t.reb+t.ast)/t.gp,
+    fgPct:t=>t.fga?t.fgm/t.fga:0, fg3Pct:t=>t.fg3a?t.fg3/t.fg3a:0, fg3a:t=>t.fg3a/t.gp
+  };
+  const D = { teams:{}, n:teams.length };
+  teams.forEach(t=> D.teams[t.id] = { abbr:t.abbr, gp:t.gp, val:{}, rank:{} });
+  for(const [k,f] of Object.entries(metrics)){
+    const sorted = [...teams].sort((a,b)=>f(a)-f(b)); // fewest allowed = rank 1 (toughest)
+    sorted.forEach((t,i)=>{ D.teams[t.id].val[k]=f(t); D.teams[t.id].rank[k]=i+1; });
+  }
+  S.defense = D;
+  scheduleRender();
+}
+
+// ===== ANALYTICS =====
+function lineFor(id, mkey){
+  const c = S.customLine[id+'|'+mkey];
+  if(c!=null && !isNaN(c)) return c;
+  return S.props[id]?.markets?.[mkey]?.line;
+}
+function rate(games, mkey, line){
+  if(line==null || !games.length) return { hits:0, n:0, rate:null, avg: games.length ? avg(games.map(MK[mkey].f)) : null };
+  const f = MK[mkey].f;
+  const vals = games.map(f);
+  const hits = vals.filter(v=>v>line).length;
+  const pushes = vals.filter(v=>v===line).length;
+  const n = vals.length - pushes;
+  return { hits, n, rate: n ? hits/n : null, avg: avg(vals) };
+}
+function splits(id, mkey){
+  const L = S.logs[id]; const p = S.players[id];
+  const games = L?.games || [];
+  const line = lineFor(id, mkey);
+  const cur = games.filter(g=>g.season===S.season), prev = games.filter(g=>g.season===S.season-1);
+  return {
+    line, games,
+    l5: rate(games.slice(0,5), mkey, line),
+    l10: rate(games.slice(0,10), mkey, line),
+    l20: rate(games.slice(0,20), mkey, line),
+    season: rate(cur, mkey, line),
+    last: rate(prev, mkey, line),
+    h2h: rate(games.filter(g=>p && g.oppId===p.oppId), mkey, line),
+  };
+}
+function fairOver(m){
+  if(!m || isNaN(m.over) || isNaN(m.under)) return null;
+  const io = implied(m.over), iu = implied(m.under);
+  return io/(io+iu);
+}
+function edgeFor(id, mkey){
+  const m = S.props[id]?.markets?.[mkey]; const fo = fairOver(m);
+  const sp = splits(id, mkey);
+  if(fo==null || sp.l10.rate==null || sp.l10.n<5) return null;
+  return sp.l10.rate - fo;
+}
+
+// ===== RENDER =====
+function setStatus(kind, msg){
+  const el = $('statusLine');
+  if(kind==='loading') el.innerHTML = `<span class="spin"></span> ${esc(msg)}`;
+  else if(kind==='error') el.innerHTML = `<span class="w-1.5 h-1.5 rounded-full bg-red-500"></span> <span class="text-red-400">${esc(msg)}</span>`;
+  else el.innerHTML = `<span class="w-1.5 h-1.5 rounded-full bg-neon animate-pulse"></span> LIVE · ESPN / DraftKings · ${msg ? esc(msg) : 'lines as of '+fmtTime(S.updatedAt||new Date())}`;
+}
+
+function renderGames(){
+  const chip = (id, html, active) => `<button data-g="${id}" class="tab shrink-0 px-3 py-1.5 rounded-md text-xs font-semibold border border-slate-700 bg-slate-900 hover:border-neon/50 text-left ${active?'active':''}">${html}</button>`;
+  let h = chip('all', `All games <span class="opacity-60 font-mono">${S.games.length}</span>`, S.gameFilter==='all');
+  S.games.forEach(g=>{
+    const st = g.status.state==='in' ? `<span class="text-red-400">● LIVE</span>` : g.status.completed ? 'FINAL' : fmtTime(g.date);
+    const props = g.propsStatus==='none' ? ' · <span class="opacity-70">no props</span>' : '';
+    h += chip(g.id, `${esc(g.away.abbr)} @ ${esc(g.home.abbr)} <span class="opacity-60 font-mono">· ${st}${g.spread?' · '+esc(g.spread):''}${g.total?' · O/U '+g.total:''}</span>${props}`, S.gameFilter===g.id);
+  });
+  $('gameChips').innerHTML = h;
+  $('gameChips').querySelectorAll('button').forEach(b=>b.onclick=()=>{ S.gameFilter=b.dataset.g; renderAll(); });
+}
+
+function renderTabs(){
+  $('marketTabs').innerHTML = MARKETS.map(m=>`<button data-k="${m.key}" class="tab shrink-0 px-3 py-1.5 rounded-md text-xs font-bold ${m.key===S.market?'active':'text-slate-400 hover:text-slate-100'}">${m.label}</button>`).join('');
+  $('marketTabs').querySelectorAll('button').forEach(b=>b.onclick=()=>{ S.market=b.dataset.k; renderAll(); });
+}
+
+function boardRows(){
+  const rows = [];
+  for(const [id,P] of Object.entries(S.props)){
+    const m = P.markets[S.market]; if(!m) continue;
+    if(S.gameFilter!=='all' && P.gameId!==S.gameFilter) continue;
+    const sp = splits(id, S.market);
+    rows.push({ id, m, sp, edge: edgeFor(id, S.market), p: S.players[id] });
+  }
+  const key = { edge: r => r.edge==null ? -9 : Math.abs(r.edge), l10: r => r.sp.l10.rate ?? -1, season: r => r.sp.season.rate ?? -1, line: r => r.m.line }[S.sort];
+  rows.sort((a,b)=> key(b)-key(a));
+  return rows;
+}
+
+function hitCell(r){
+  if(r.rate==null) return `<span class="text-slate-600">—</span>`;
+  const c = r.rate>=0.6 ? 'text-neon' : r.rate<=0.4 ? 'text-red-400' : 'text-yellow-300';
+  return `<span class="${c} font-semibold">${Math.round(r.rate*100)}</span>`;
+}
+
+function renderBoard(){
+  const rows = boardRows();
+  $('boardCount').textContent = rows.length ? `· ${rows.length}` : '';
+  if(S.loadingSlate){ $('boardBody').innerHTML = `<tr><td colspan="6" class="py-8 text-center text-slate-500"><span class="spin"></span></td></tr>`; return; }
+  if(!rows.length){
+    $('boardBody').innerHTML = `<tr><td colspan="6" class="py-8 text-center text-slate-500 text-xs">No DraftKings ${MK[S.market].label} props posted${S.gameFilter!=='all'?' for this game':''} yet.<br/>DK usually posts the day of the game and pulls them at tip-off.</td></tr>`;
+    return;
+  }
+  $('boardBody').innerHTML = rows.map(r=>{
+    const p = r.p || { name:'Player '+r.id, team:'', opp:'' };
+    const loading = S.logs[r.id]?.status !== 'ok';
+    const e = r.edge;
+    const ec = e==null ? 'pill-dim' : e>0.08 ? 'pill-hit' : e<-0.08 ? 'pill-miss' : 'pill-neut';
+    const et = e==null ? '—' : (e>0?'+':'')+Math.round(e*100);
+    const inj = p.injury ? `<span class="ml-1 text-[9px] font-bold px-1 rounded ${/out/i.test(p.injury)?'bg-red-500/20 text-red-400':'bg-yellow-500/20 text-yellow-300'}">${esc(p.injury.slice(0,3).toUpperCase())}</span>` : '';
+    return `<tr data-id="${r.id}" class="border-b border-slate-800/60 cursor-pointer hover:bg-slate-800/40 ${r.id===S.playerId?'row-sel':''}">
+      <td class="py-2 pr-2"><div class="font-semibold text-[13px] leading-tight truncate max-w-[150px]">${esc(p.name)}${inj}</div><div class="text-[10px] text-slate-500 font-mono">${esc(p.team)} ${p.home?'vs':'@'} ${esc(p.opp)}</div></td>
+      <td class="py-2 pr-2 font-mono"><div class="font-bold">${r.m.line}</div><div class="text-[10px] text-slate-500">${fmtOdds(r.m.over)}/${fmtOdds(r.m.under)}</div></td>
+      ${loading ? `<td colspan="3" class="text-center"><span class="spin"></span></td>` :
+        `<td class="py-2 pr-2 text-center font-mono text-xs">${hitCell(r.sp.l5)}</td><td class="py-2 pr-2 text-center font-mono text-xs">${hitCell(r.sp.l10)}</td><td class="py-2 pr-2 text-center font-mono text-xs">${hitCell(r.sp.season)}</td>`}
+      <td class="py-2 text-right"><span class="pill ${ec}">${et}</span></td>
+    </tr>`;
+  }).join('');
+  $('boardBody').querySelectorAll('tr[data-id]').forEach(tr=>tr.onclick=()=>selectPlayer(tr.dataset.id));
+}
+
+function selectPlayer(id, scroll=true){
+  S.playerId = id;
+  loadLog(id, true);
+  renderAll();
+  if(scroll && window.innerWidth < 1280) $('detail').scrollIntoView({behavior:'smooth', block:'start'});
+}
+
+// ---------- DETAIL ----------
+function renderDetail(){
+  const el = $('detail');
+  if(S.loadingSlate && !S.playerId){ el.innerHTML = `<div class="card p-10 text-center text-slate-500"><span class="spin"></span><div class="mt-3 text-sm">Loading tonight's slate…</div></div>`; return; }
+  if(!S.games.length){ el.innerHTML = `<div class="card p-10 text-center text-slate-400">No NBA games on ${esc(S.date)}. Pick another date above.</div>`; return; }
+  const id = S.playerId;
+  if(!id || !S.players[id] && !S.props[id]){ el.innerHTML = `<div class="card p-10 text-center text-slate-400">Pick a player from the Prop Board or search above.</div>`; return; }
+  const p = S.players[id] || { name:'Player '+id, team:'', opp:'', pos:'' };
+  const L = S.logs[id];
+  const mk = MK[S.market];
+  const m = S.props[id]?.markets?.[S.market];
+  const game = S.games.find(g=>g.id===p.gameId);
+  const sp = splits(id, S.market);
+  const loading = !L || L.status!=='ok';
+
+  el.innerHTML = `
+    ${heroHTML(p, game, sp, mk)}
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-5">
+      <div class="card p-5 glow">${oddsHTML(id, p, m, sp, mk)}</div>
+      <div class="lg:col-span-2 space-y-5">
+        <div class="grid grid-cols-2 sm:grid-cols-3 gap-3">${loading ? skeleton(6) : hitCardsHTML(sp, p)}</div>
+        <div class="card p-5">
+          <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
+            <h3 class="font-bold text-sm uppercase tracking-wider text-slate-400">Last 15 vs. Tonight's Line</h3>
+            <div class="flex items-center gap-4 text-[11px] text-slate-500 font-mono">
+              <span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-sm bg-neon"></span>Over</span>
+              <span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-sm bg-miss"></span>Under</span>
+              <span class="flex items-center gap-1"><span class="w-4 border-t border-dashed border-slate-300"></span>${sp.line ?? 'no line'}</span>
+            </div>
+          </div>
+          <div id="chart">${loading ? `<div class="h-48 grid place-items-center"><span class="spin"></span></div>` : chartSVG(sp, mk)}</div>
+        </div>
+      </div>
+    </div>
+    <div class="card p-5">${loading ? `<div class="py-6 text-center"><span class="spin"></span></div>` : logHTML(id, p, sp, mk)}</div>
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-5">
+      <div class="card p-5">${altHTML(id, sp, mk)}</div>
+      <div class="card p-5">${defenseHTML(p, mk)}</div>
+    </div>
+    <div class="card p-5">${loading ? '' : shootingHTML(p, sp)}</div>
+  `;
+  wireDetail(id);
+}
+
+function skeleton(n){ return Array.from({length:n}).map(()=>`<div class="card p-4 h-[108px] grid place-items-center"><span class="spin"></span></div>`).join(''); }
+
+function heroHTML(p, game, sp, mk){
+  const def = S.defense?.teams?.[p.oppId];
+  const r = def?.rank?.[mk.key];
+  const recent = sp.games.slice(0,10);
+  const l10avg = recent.length ? avg(recent.map(mk.f)) : null;
+  const min = recent.length ? avg(recent.map(g=>g.min)) : null;
+  const inj = p.injury ? `<span class="pill ${/out/i.test(p.injury)?'pill-miss':'pill-neut'}" title="${esc(p.injDetail)}">${esc(p.injury)}</span>` : '';
+  const img = p.headshot ? `<img src="${esc(p.headshot)}" alt="" class="w-16 h-16 rounded-xl object-cover bg-slate-800 border border-slate-700" onerror="this.style.display='none'">` :
+    `<div class="w-16 h-16 rounded-xl bg-slate-800 border border-slate-700 grid place-items-center font-extrabold">${esc((p.name||'?').split(' ').map(s=>s[0]).join('').slice(0,2))}</div>`;
+  const box = (label, val, color) => `<div class="bg-slate-900/70 border border-slate-800 rounded-lg px-3 py-2"><div class="text-[10px] uppercase tracking-wider text-slate-500 whitespace-nowrap">${label}</div><div class="text-lg font-bold font-mono" ${color?`style="color:${color}"`:''}>${val}</div></div>`;
+  return `<div class="card p-4 sm:p-5 fade-in">
+    <div class="flex flex-col md:flex-row md:items-center gap-4">
+      <div class="flex items-center gap-4">
+        ${img}
+        <div>
+          <div class="flex items-center gap-2 flex-wrap"><h2 class="text-xl sm:text-2xl font-extrabold tracking-tight">${esc(p.name)}</h2><span class="text-xs font-mono text-slate-500">${p.jersey?'#'+esc(p.jersey)+' · ':''}${esc(p.pos)}</span>${inj}</div>
+          <div class="text-sm text-slate-400 mt-0.5 font-mono">${esc(p.team)} ${p.home?'vs':'@'} <span class="text-slate-200 font-semibold">${esc(p.opp)}</span>${game?` · ${game.status.state==='pre'||!game.status.state?fmtTime(game.date):esc(game.status.shortDetail||game.status.description||'')}`:''}${game?.spread?` · ${esc(game.spread)}`:''}${game?.total?` · O/U ${game.total}`:''}</div>
+        </div>
+      </div>
+      <div class="md:ml-auto grid grid-cols-2 sm:grid-cols-4 gap-2 text-center">
+        ${box(`L10 ${mk.label}`, l10avg==null?'—':l10avg.toFixed(1))}
+        ${box('L10 Minutes', min==null?'—':min.toFixed(1))}
+        ${box('DK Line', sp.line ?? '—', '#39ff88')}
+        ${box(`${esc(p.opp)} D vs ${mk.label}`, r?ord(r):'…', rankColor(r))}
+      </div>
+    </div>
+  </div>`;
+}
+
+function oddsHTML(id, p, m, sp, mk){
+  const custom = S.customLine[id+'|'+mk.key];
+  let top;
+  if(m){
+    const io = implied(m.over), iu = implied(m.under), fo = io/(io+iu), hold = io+iu-1;
+    const moved = m.openLine!=null && m.openLine!==m.line;
+    const edge = sp.l10.rate!=null && sp.l10.n>=5 && custom==null ? sp.l10.rate - fo : null;
+    const lean = edge==null ? ['NOT ENOUGH DATA','pill-dim'] : edge>0.08 ? ['OVER LEAN','pill-hit'] : edge<-0.08 ? ['UNDER LEAN','pill-miss'] : ['NO EDGE','pill-neut'];
+    top = `
+      <div class="mt-4 text-center">
+        <div class="text-xs text-slate-500 font-mono">O/U</div>
+        <div class="text-6xl font-extrabold font-mono text-neon leading-none my-1">${m.line}</div>
+        <div class="text-sm text-slate-400">${esc(p.name.split(' ').slice(-1)[0])} ${mk.label}</div>
+        ${moved ? `<div class="text-[11px] font-mono mt-1 ${m.line>m.openLine?'text-neon':'text-red-400'}">${m.line>m.openLine?'▲':'▼'} moved from ${m.openLine} at open</div>` : `<div class="text-[11px] font-mono mt-1 text-slate-600">Opened at ${m.openLine ?? m.line}</div>`}
+      </div>
+      <div class="grid grid-cols-2 gap-3 mt-4">
+        <div class="rounded-lg border border-neon/30 bg-neon/5 p-3 text-center">
+          <div class="text-[10px] uppercase tracking-wider text-slate-400">Over ${m.line}</div>
+          <div class="text-2xl font-bold font-mono">${fmtOdds(m.over)}</div>
+          <div class="text-[11px] font-mono text-slate-400 mt-1">Implied ${pct(io)}</div>
+          ${!isNaN(m.openOver)&&m.openOver!==m.over?`<div class="text-[10px] font-mono text-slate-600">open ${fmtOdds(m.openOver)}</div>`:''}
+        </div>
+        <div class="rounded-lg border border-red-500/30 bg-red-500/5 p-3 text-center">
+          <div class="text-[10px] uppercase tracking-wider text-slate-400">Under ${m.line}</div>
+          <div class="text-2xl font-bold font-mono">${fmtOdds(m.under)}</div>
+          <div class="text-[11px] font-mono text-slate-400 mt-1">Implied ${pct(iu)}</div>
+          ${!isNaN(m.openUnder)&&m.openUnder!==m.under?`<div class="text-[10px] font-mono text-slate-600">open ${fmtOdds(m.openUnder)}</div>`:''}
+        </div>
+      </div>
+      <div class="mt-4 space-y-1.5 text-xs font-mono">
+        <div class="flex justify-between"><span class="text-slate-500">Book hold (vig)</span><span>${pct(hold,2)}</span></div>
+        <div class="flex justify-between"><span class="text-slate-500">No-vig fair Over / Under</span><span>${pct(fo)} / ${pct(1-fo)}</span></div>
+        <div class="flex justify-between"><span class="text-slate-500">L10 hit vs fair Over</span><span style="color:${edge==null?'#94a3b8':edge>=0?'#39ff88':'#f87171'}">${edge==null?'—':(edge>=0?'+':'')+(edge*100).toFixed(1)+' pts'}</span></div>
+        <div class="flex justify-between items-center pt-1"><span class="text-slate-500">Signal</span><span class="pill ${lean[1]}">${lean[0]}</span></div>
+        ${m.updated?`<div class="text-[10px] text-slate-600 text-right pt-1">DK updated ${fmtTime(m.updated)}</div>`:''}
+      </div>`;
+  } else {
+    top = `<div class="mt-6 text-center text-sm text-slate-400">No DraftKings ${mk.label} line posted for ${esc(p.name)}.<div class="text-xs text-slate-500 mt-1">Enter a line below to run the numbers anyway.</div></div>`;
+  }
+  return `<div class="fade-in">
+    <div class="flex items-center justify-between">
+      <h3 class="font-bold text-sm uppercase tracking-wider text-slate-400">DraftKings Line</h3>
+      <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-400">${mk.label.toUpperCase()}</span>
+    </div>
+    ${top}
+    <div class="mt-5 pt-4 border-t border-slate-800">
+      <div class="text-[11px] uppercase tracking-wider text-slate-500 mb-2">Test a different line</div>
+      <div class="flex gap-2">
+        <input id="customLine" type="number" step="0.5" placeholder="${m?m.line:'e.g. 24.5'}" value="${custom ?? ''}" class="w-28 bg-slate-950 border border-slate-700 rounded-md px-3 py-2 font-mono text-sm outline-none focus:border-neon/60" />
+        <button id="customReset" class="text-xs text-slate-400 hover:text-white px-2 ${custom==null?'invisible':''}">Reset to DK</button>
+      </div>
+    </div>
+    <div class="mt-4">
+      <div class="text-[11px] uppercase tracking-wider text-slate-500 mb-2">Implied Probability Calculator</div>
+      <div class="flex gap-2">
+        <input id="calcOdds" type="number" value="${m?m.over:-110}" class="w-28 bg-slate-950 border border-slate-700 rounded-md px-3 py-2 font-mono text-sm outline-none focus:border-neon/60" />
+        <div class="flex-1 bg-slate-950 border border-slate-800 rounded-md px-3 py-2 font-mono text-sm flex items-center justify-between">
+          <span class="text-slate-500 text-xs">Break-even</span><span id="calcOut" class="font-bold text-neon"></span>
+        </div>
+      </div>
+      <div id="calcPayout" class="text-[11px] text-slate-500 font-mono mt-1.5"></div>
+    </div>
+  </div>`;
+}
+
+function hitCardsHTML(sp, p){
+  const card = (label, r, sub) => {
+    const c = r.rate==null ? '#64748b' : r.rate>=0.6 ? '#39ff88' : r.rate<=0.4 ? '#f87171' : '#facc15';
+    return `<div class="card p-4 fade-in">
+      <div class="flex justify-between items-start gap-1">
+        <div class="text-[11px] uppercase tracking-wider text-slate-500 font-semibold">${label}</div>
+        <div class="text-[11px] font-mono text-slate-500">${r.n?`${r.hits}/${r.n}`:''}</div>
+      </div>
+      <div class="text-3xl font-extrabold font-mono mt-1.5" style="color:${c}">${r.rate==null?'—':Math.round(r.rate*100)+'%'}</div>
+      <div class="h-1.5 rounded-full bg-slate-800 mt-2 overflow-hidden"><div class="h-full rounded-full" style="width:${(r.rate||0)*100}%;background:${c}"></div></div>
+      <div class="text-[11px] font-mono text-slate-400 mt-1.5">${r.avg==null||isNaN(r.avg)?(sub||'No games'):'Avg '+r.avg.toFixed(1)}</div>
+    </div>`;
+  };
+  const sYr = s => `${String(s-1).slice(2)}-${String(s).slice(2)}`;
+  return card('Last 5', sp.l5) + card('Last 10', sp.l10) + card('Last 20', sp.l20) +
+         card(`${sYr(S.season)} Season`, sp.season) + card(`${sYr(S.season-1)} Season`, sp.last) + card(`vs ${esc(p.opp)}`, sp.h2h, 'No games vs '+p.opp);
+}
+
+function chartSVG(sp, mk){
+  const games = sp.games.slice(0,15).reverse();
+  if(!games.length) return `<div class="h-40 grid place-items-center text-slate-500 text-sm">No game logs found.</div>`;
+  const line = sp.line;
+  const W=680,H=240,padL=32,padR=10,padT=22,padB=36;
+  const maxV = Math.max(line||0, ...games.map(mk.f))*1.15 || 1;
+  const y = v => padT + (H-padT-padB)*(1 - v/maxV);
+  const bw = (W-padL-padR)/games.length;
+  let s = `<svg viewBox="0 0 ${W} ${H}" class="w-full h-auto" font-family="JetBrains Mono, monospace">`;
+  for(let i=0;i<=4;i++){ const v=maxV*i/4, yy=y(v); s+=`<line x1="${padL}" x2="${W-padR}" y1="${yy}" y2="${yy}" stroke="#1e293b"/><text x="${padL-6}" y="${yy+3}" text-anchor="end" font-size="9" fill="#64748b">${Math.round(v)}</text>`; }
+  games.forEach((g,i)=>{
+    const v = mk.f(g), x = padL+i*bw+bw*0.16, w = bw*0.68;
+    const hit = line!=null && v>line, col = line==null ? '#64748b' : hit ? '#39ff88' : '#ef4444';
+    const top = y(v);
+    s += `<rect x="${x}" y="${top}" width="${w}" height="${Math.max(0,H-padB-top)}" rx="4" fill="${col}" fill-opacity="${g.season===S.season?0.88:0.5}"><title>${fmtDate(g.date)} ${g.atVs} ${g.opp}: ${v} ${mk.label} (${g.min} min)</title></rect>`;
+    s += `<text x="${x+w/2}" y="${top-5}" text-anchor="middle" font-size="11" font-weight="700" fill="#e2e8f0">${v}</text>`;
+    s += `<text x="${x+w/2}" y="${H-padB+14}" text-anchor="middle" font-size="9.5" fill="#94a3b8">${g.atVs==='@'?'@':''}${esc(g.opp)}</text>`;
+    s += `<text x="${x+w/2}" y="${H-padB+26}" text-anchor="middle" font-size="8.5" fill="#475569">${fmtDate(g.date)}</text>`;
+  });
+  if(line!=null){ s += `<line x1="${padL}" x2="${W-padR}" y1="${y(line)}" y2="${y(line)}" stroke="#f1f5f9" stroke-dasharray="5 4" stroke-width="1.3"/><text x="${W-padR}" y="${y(line)-5}" text-anchor="end" font-size="10" font-weight="700" fill="#f1f5f9">${line}</text>`; }
+  s += `</svg><div class="text-[10px] text-slate-600 mt-1">Faded bars = last season.</div>`;
+  return s;
+}
+
+function logHTML(id, p, sp, mk){
+  const views = { l10:['L10', sp.games.slice(0,10)], l20:['L20', sp.games.slice(0,20)], season:['This season', sp.games.filter(g=>g.season===S.season)],
+                  last:['Last season', sp.games.filter(g=>g.season===S.season-1)], h2h:[`vs ${p.opp}`, sp.games.filter(g=>g.oppId===p.oppId)] };
+  const [_, games] = views[S.logView];
+  const line = sp.line;
+  const rows = games.map(g=>{
+    const v = mk.f(g);
+    const hit = line!=null && v>line, push = line===v;
+    const diff = line ? (v-line)/line*100 : null;
+    const cls = line==null||push ? 'pill-dim' : hit ? 'pill-hit' : 'pill-miss';
+    return `<tr class="border-b border-slate-800/70 hover:bg-slate-800/30">
+      <td class="py-2 pr-3 text-slate-400">${fmtDate(g.date)}${g.season!==S.season?`<span class="text-slate-600"> '${String(g.date.getFullYear()).slice(2)}</span>`:''}</td>
+      <td class="py-2 pr-3 font-sans font-semibold">${g.atVs} ${esc(g.opp)}</td>
+      <td class="py-2 pr-3 ${g.result==='W'?'text-neon':'text-red-400'}">${esc(g.result)} <span class="text-slate-500">${esc(g.score)}</span></td>
+      <td class="py-2 pr-3 text-slate-400">${g.min}</td>
+      <td class="py-2 pr-3 text-slate-400">${g.pts}/${g.reb}/${g.ast}/${g.fg3}</td>
+      <td class="py-2 pr-3">${line ?? '—'}</td>
+      <td class="py-2 pr-3 font-bold">${v}</td>
+      <td class="py-2 pr-3"><span class="pill ${cls}">${diff==null?'—':(diff>=0?'+':'')+diff.toFixed(1)+'%'}</span></td>
+      <td class="py-2"><span class="pill ${cls}">${line==null?'—':push?'P':hit?'O':'U'}</span></td>
+    </tr>`;
+  }).join('');
+  return `<div class="flex flex-wrap items-center justify-between gap-2 mb-4">
+      <h3 class="font-bold text-sm uppercase tracking-wider text-slate-400">Game Log · ${mk.label}</h3>
+      <div class="flex gap-1 bg-slate-900 border border-slate-800 rounded-md p-0.5 text-xs overflow-x-auto scroll-thin" id="logToggle">
+        ${Object.entries(views).map(([k,[lab,arr]])=>`<button data-v="${k}" class="tab px-3 py-1 rounded font-semibold whitespace-nowrap ${S.logView===k?'active':'text-slate-400'}">${esc(lab)} <span class="opacity-60">${arr.length}</span></button>`).join('')}
+      </div>
+    </div>
+    <div class="overflow-x-auto scroll-thin">
+      <table class="w-full text-sm">
+        <thead><tr class="text-left text-[11px] uppercase tracking-wider text-slate-500 border-b border-slate-800">
+          <th class="py-2 pr-3">Date</th><th class="py-2 pr-3">Opp</th><th class="py-2 pr-3">Result</th><th class="py-2 pr-3">Min</th><th class="py-2 pr-3">P/R/A/3PM</th>
+          <th class="py-2 pr-3">Line*</th><th class="py-2 pr-3">${mk.label}</th><th class="py-2 pr-3">Diff %</th><th class="py-2">O/U</th></tr></thead>
+        <tbody class="font-mono">${rows || `<tr><td colspan="9" class="py-6 text-center text-slate-500 font-sans">No games in this view.</td></tr>`}</tbody>
+      </table>
+    </div>
+    <p class="text-[10px] text-slate-600 mt-2">*Line = tonight's line applied to each past game. Regular season only.</p>`;
+}
+
+function altHTML(id, sp, mk){
+  const alts = S.props[id]?.alts?.[mk.key] || [];
+  const head = `<h3 class="font-bold text-sm uppercase tracking-wider text-slate-400 mb-1">Alt Lines Ladder</h3><p class="text-[11px] text-slate-500 mb-3">DraftKings "X+" milestones. Value = L10 hit rate minus the price's implied %.</p>`;
+  if(!alts.length) return head + `<div class="text-sm text-slate-500 py-6 text-center">No DK alt lines posted for ${mk.label}.</div>`;
+  const L10 = sp.games.slice(0,10), SZ = sp.games.filter(g=>g.season===S.season);
+  const hr = (arr,t) => arr.length ? arr.filter(g=>mk.f(g)>=t).length/arr.length : null;
+  const rows = alts.map(a=>{
+    const ip = implied(a.odds), h10 = hr(L10,a.t), hs = hr(SZ,a.t);
+    const val = h10==null ? null : h10 - ip;
+    const vc = val==null ? 'pill-dim' : val>0.1 ? 'pill-hit' : val<-0.1 ? 'pill-miss' : 'pill-neut';
+    return `<tr class="border-b border-slate-800/70">
+      <td class="py-2 pr-3 font-bold">${a.t}+</td><td class="py-2 pr-3">${fmtOdds(a.odds)}</td><td class="py-2 pr-3 text-slate-400">${pct(ip,0)}</td>
+      <td class="py-2 pr-3">${pct(h10,0)}</td><td class="py-2 pr-3 text-slate-400">${pct(hs,0)}</td>
+      <td class="py-2"><span class="pill ${vc}">${val==null?'—':(val>0?'+':'')+Math.round(val*100)}</span></td></tr>`;
+  }).join('');
+  return head + `<div class="overflow-x-auto scroll-thin max-h-80 overflow-y-auto"><table class="w-full text-sm font-mono">
+    <thead class="sticky top-0 bg-slate-900"><tr class="text-left text-[11px] uppercase tracking-wider text-slate-500 border-b border-slate-800 font-sans">
+      <th class="py-2 pr-3">Alt</th><th class="py-2 pr-3">Odds</th><th class="py-2 pr-3">Impl.</th><th class="py-2 pr-3">L10</th><th class="py-2 pr-3">Szn</th><th class="py-2">Value</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+}
+
+function defenseHTML(p, mk){
+  const head = `<h3 class="font-bold text-sm uppercase tracking-wider text-slate-400 mb-1">${esc(p.opp)} Defense Profile</h3>`;
+  if(!S.defense) return head + `<div class="py-8 text-center text-slate-500 text-sm"><span class="spin"></span><div class="mt-2 text-xs">Crunching every box score this season…</div></div>`;
+  const d = S.defense.teams[p.oppId];
+  if(!d) return head + `<div class="text-sm text-slate-500 py-6">No completed games for ${esc(p.opp)} yet this season.</div>`;
+  const rowsDef = [
+    ['pts','Points allowed',1],['reb','Rebounds allowed',1],['ast','Assists allowed',1],['fg3','3PM allowed',1],
+    ['pra','PRA allowed',1],['fgPct','Opp FG%',0],['fg3Pct','Opp 3P%',0],['fg3a','3PA allowed',1]
+  ];
+  const fmt = (k,v) => k.endsWith('Pct') ? (v*100).toFixed(1)+'%' : v.toFixed(1);
+  const weighted = d.rank[mk.key];
+  return head + `<p class="text-[11px] text-slate-500 mb-3">Per game, from ${d.gp} games this season. Rank 1 = allows the fewest (toughest). <span class="text-red-400">1–10 tough</span> · <span class="text-yellow-400">11–20 neutral</span> · <span class="text-neon">21–30 favorable</span></p>
+    <div class="flex items-center gap-2 mb-3"><span class="text-xs text-slate-400">${mk.label} matchup:</span><span class="pill ${rankClass(weighted)}">#${weighted} · ${rankLabel(weighted)}</span></div>
+    <table class="w-full text-sm"><tbody>
+    ${rowsDef.map(([k,label])=>{ const r=d.rank[k]; const hl = k===mk.key || (mk.key.length===2 && mk.key!=='pts' && k==='pra' && false);
+      return `<tr class="border-b border-slate-800/70 ${k===mk.key?'row-sel':''}"><td class="py-2 pr-3 ${k===mk.key?'font-bold':''}">${label}</td><td class="py-2 pr-3 font-mono">${fmt(k,d.val[k])}</td><td class="py-2 pr-3"><span class="pill ${rankClass(r)}">#${r}</span></td><td class="py-2 text-xs font-semibold" style="color:${rankColor(r)}">${rankLabel(r)}</td></tr>`; }).join('')}
+    </tbody></table>
+    ${d.gp<6?`<p class="text-[10px] text-yellow-500/80 mt-2">Small sample early in the season. Treat ranks loosely.</p>`:''}`;
+}
+
+function shootingHTML(p, sp){
+  const L10 = sp.games.slice(0,10), SZ = sp.games.filter(g=>g.season===S.season), base = SZ.length>=5 ? SZ : sp.games.slice(0,30);
+  if(!L10.length) return '';
+  const sum = (a,k)=>a.reduce((s,g)=>s+g[k],0);
+  const d = S.defense?.teams?.[p.oppId];
+  const tile = (title, l10line, l10pct, basePct, rankK, rankTxt) => {
+    const r = d?.rank?.[rankK];
+    const trend = l10pct!=null && basePct!=null ? l10pct-basePct : null;
+    return `<div class="rounded-xl border bg-slate-900/60 p-4" style="border-color:${rankColor(r)}55">
+      <div class="flex items-start justify-between gap-2"><div class="text-sm font-semibold">${title}</div>${r?`<span class="pill ${rankClass(r)}">#${r}</span>`:''}</div>
+      <div class="text-2xl font-extrabold font-mono mt-2">${l10line}</div>
+      <div class="flex justify-between text-[11px] font-mono text-slate-400 mt-1"><span>L10 ${l10pct==null?'':pct(l10pct)}</span>
+        <span class="${trend==null?'':trend>=0?'text-neon':'text-red-400'}">${trend==null?'':(trend>=0?'▲':'▼')+' vs '+(base===SZ?'season':'L30')}</span></div>
+      <div class="text-[11px] mt-1" style="color:${rankColor(r)}">${r?`${esc(p.opp)} ${rankTxt}: ${rankLabel(r)}`:''}</div>
+    </div>`;
+  };
+  const per = (a,k)=> a.length ? (sum(a,k)/a.length).toFixed(1) : '—';
+  const ratio = (a,m,t)=> sum(a,t) ? sum(a,m)/sum(a,t) : null;
+  const minL10 = avg(L10.map(g=>g.min)), minBase = avg(base.map(g=>g.min));
+  return `<h3 class="font-bold text-sm uppercase tracking-wider text-slate-400 mb-1">Shooting & Usage vs ${esc(p.opp)}</h3>
+    <p class="text-[11px] text-slate-500 mb-3">His recent shooting (per game) against what ${esc(p.opp)} allows. Badge = ${esc(p.opp)}'s defensive rank.</p>
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+      ${tile('Field Goals', `${per(L10,'fgm')}-${per(L10,'fga')}`, ratio(L10,'fgm','fga'), ratio(base,'fgm','fga'), 'fgPct', 'FG% allowed')}
+      ${tile('Three-Pointers', `${per(L10,'fg3')}-${per(L10,'fg3a')}`, ratio(L10,'fg3','fg3a'), ratio(base,'fg3','fg3a'), 'fg3a', '3PA allowed')}
+      ${tile('Free Throws', `${per(L10,'ftm')}-${per(L10,'fta')}`, ratio(L10,'ftm','fta'), ratio(base,'ftm','fta'), null, '')}
+      <div class="rounded-xl border border-slate-700 bg-slate-900/60 p-4">
+        <div class="text-sm font-semibold">Minutes</div>
+        <div class="text-2xl font-extrabold font-mono mt-2">${minL10.toFixed(1)}</div>
+        <div class="flex justify-between text-[11px] font-mono text-slate-400 mt-1"><span>L10 avg</span><span class="${minL10-minBase>=0?'text-neon':'text-red-400'}">${minL10-minBase>=0?'▲':'▼'} ${Math.abs(minL10-minBase).toFixed(1)} vs ${base===SZ?'season':'L30'}</span></div>
+        <div class="text-[11px] mt-1 text-slate-500">L5: ${avg(L10.slice(0,5).map(g=>g.min)).toFixed(1)} min</div>
+      </div>
+    </div>`;
+}
+
+function wireDetail(id){
+  const lt = $('logToggle');
+  if(lt) lt.querySelectorAll('button').forEach(b=>b.onclick=()=>{ S.logView=b.dataset.v; renderDetail(); });
+  const cl = $('customLine');
+  if(cl){
+    cl.onchange = () => { const v = parseFloat(cl.value); const k = id+'|'+S.market; if(isNaN(v)) delete S.customLine[k]; else S.customLine[k]=v; renderAll(); };
+    cl.onkeydown = e => { if(e.key==='Enter') cl.blur(); };
+  }
+  const cr = $('customReset'); if(cr) cr.onclick = () => { delete S.customLine[id+'|'+S.market]; renderAll(); };
+  const ci = $('calcOdds');
+  if(ci){
+    const calc = ()=>{ const v=parseFloat(ci.value);
+      if(!v||Math.abs(v)<100){ $('calcOut').textContent='—'; $('calcPayout').textContent='Enter American odds (e.g. -110 or +150)'; return; }
+      $('calcOut').textContent = pct(implied(v),2);
+      $('calcPayout').textContent = `$100 stake → $${(v>0?v:10000/(-v)).toFixed(2)} profit`; };
+    ci.oninput = calc; calc();
+  }
+}
+
+function renderAll(){
+  // keep focus on inputs inside detail from being destroyed mid-typing
+  const ae = document.activeElement?.id;
+  if(ae==='customLine' || ae==='calcOdds'){ renderBoard(); return; }
+  renderGames(); renderTabs(); renderBoard(); renderDetail();
+}
+
+// ===== SEARCH =====
+let activeIdx = -1;
+function searchList(){
+  const q = $('search').value.trim().toLowerCase();
+  return Object.values(S.players)
+    .filter(p => !q || p.name.toLowerCase().includes(q) || p.team.toLowerCase()===q)
+    .sort((a,b)=> (S.props[b.id]?1:0)-(S.props[a.id]?1:0) || a.name.localeCompare(b.name))
+    .slice(0,40);
+}
+function showDropdown(){
+  const list = searchList();
+  activeIdx = list.length ? 0 : -1;
+  $('dropdown').innerHTML = list.length ? list.map((p,i)=>`
+    <li data-id="${p.id}" class="px-3 py-2 cursor-pointer flex items-center justify-between gap-2 text-sm ${i===0?'bg-slate-800':''} hover:bg-slate-800">
+      <span class="font-semibold truncate">${esc(p.name)}${p.injury?` <span class="text-[10px] text-yellow-400">${esc(p.injury)}</span>`:''}</span>
+      <span class="font-mono text-[11px] text-slate-500 shrink-0">${esc(p.team)} ${p.home?'vs':'@'} ${esc(p.opp)}${S.props[p.id]?' · <span class="text-neon">props</span>':''}</span>
+    </li>`).join('') : `<li class="px-3 py-2.5 text-sm text-slate-500">${Object.keys(S.players).length?'No players found':'Slate still loading…'}</li>`;
+  $('dropdown').classList.remove('hidden');
+  $('dropdown').querySelectorAll('li[data-id]').forEach(li=>li.onmousedown=()=>{ $('search').value=''; $('dropdown').classList.add('hidden'); selectPlayer(li.dataset.id); });
+}
+$('search').addEventListener('input', showDropdown);
+$('search').addEventListener('focus', showDropdown);
+$('search').addEventListener('blur', ()=>setTimeout(()=>$('dropdown').classList.add('hidden'),150));
+$('search').addEventListener('keydown', e=>{
+  const items = [...$('dropdown').querySelectorAll('li[data-id]')];
+  if(!items.length) return;
+  if(e.key==='ArrowDown'||e.key==='ArrowUp'){ e.preventDefault(); activeIdx=(activeIdx+(e.key==='ArrowDown'?1:-1)+items.length)%items.length; items.forEach((li,i)=>li.classList.toggle('bg-slate-800',i===activeIdx)); items[activeIdx].scrollIntoView({block:'nearest'}); }
+  else if(e.key==='Enter' && activeIdx>=0){ const id=items[activeIdx].dataset.id; $('search').value=''; $('search').blur(); selectPlayer(id); }
+  else if(e.key==='Escape'){ $('search').blur(); }
+});
+
+// ===== BOOT =====
+$('boardSort').onchange = e => { S.sort = e.target.value; renderBoard(); };
+$('refreshBtn').onclick = async () => {
+  const keep = S.playerId;
+  setStatus('loading','Refreshing lines…');
+  S.props = {};
+  await Promise.all(S.games.map(loadProps));
+  S.updatedAt = new Date(); setStatus('ok');
+  Object.keys(S.props).forEach(id=>loadLog(id));
+  S.playerId = keep; renderAll();
+};
+$('datePick').onchange = e => { if(e.target.value){ S.date = e.target.value; loadSlate(); } };
+
+(function boot(){
+  const now = new Date();
+  S.date = isoDay(now);
+  S.season = now.getMonth() >= 8 ? now.getFullYear()+1 : now.getFullYear();
+  $('datePick').value = S.date;
+  try { const sv = lsGet('dkat-prefs'); if(sv?.market && MK[sv.market]) S.market = sv.market; if(sv?.sort) { S.sort = sv.sort; $('boardSort').value = sv.sort; } } catch(e){}
+  window.addEventListener('beforeunload', ()=>lsSet('dkat-prefs', { market:S.market, sort:S.sort }));
+  renderAll();
+  loadSlate();
+  // auto-refresh lines every 5 minutes
+  setInterval(()=>{ if(!document.hidden && S.games.some(g=>!g.status.completed)) $('refreshBtn').click(); }, 5*60*1000);
+})();
+</script>
+</body>
+</html>
