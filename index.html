@@ -66,6 +66,7 @@
 
 <main class="max-w-[1500px] mx-auto px-4 py-5">
   <div id="notice" class="hidden card p-4 mb-5 text-sm"></div>
+  <section id="agentPanel" class="card p-4 sm:p-5 mb-5 glow"></section>
   <div class="grid grid-cols-1 xl:grid-cols-12 gap-5">
 
     <!-- PROP BOARD -->
@@ -164,7 +165,8 @@ function limiter(n){
 const limit = limiter(8);
 
 let renderQueued = false;
-function scheduleRender(){ if(renderQueued) return; renderQueued = true; requestAnimationFrame(()=>{ renderQueued=false; renderAll(); }); }
+function scheduleRender(){ if(renderQueued) return; renderQueued = true; setTimeout(()=>{ renderQueued=false; renderAll(); }, 60); }
+document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) scheduleRender(); });
 
 // ===== DATA: SLATE, ROSTERS, PROPS =====
 async function loadSlate(){
@@ -780,7 +782,251 @@ function renderAll(){
   // keep focus on inputs inside detail from being destroyed mid-typing
   const ae = document.activeElement?.id;
   if(ae==='customLine' || ae==='calcOdds'){ renderBoard(); return; }
-  renderGames(); renderTabs(); renderBoard(); renderDetail();
+  renderGames(); renderTabs(); renderBoard(); renderDetail(); renderAgents();
+}
+
+// ===== AGENT TEAM (Gemini) =====
+// Quinn (Quant), Scout (Matchup), Vig (Market) report in parallel; Chief ranks picks by conviction to hit.
+const AG = {
+  key: lsGet('dkat-gemini-key') || '',
+  model: lsGet('dkat-gemini-model') || '',
+  nPicks: lsGet('dkat-agent-npicks') || 8,
+  models: [], showSettings: false, running: false, steps: {}, error: null, result: null, showReports: false, open: true
+};
+const AGENTS = [
+  { key:'quinn', name:'Quinn', role:'Quant' },
+  { key:'scout', name:'Scout', role:'Matchup' },
+  { key:'vig',   name:'Vig',   role:'Market' },
+  { key:'chief', name:'Chief', role:'Mission Control' },
+];
+const GEM = 'https://generativelanguage.googleapis.com/v1beta';
+
+async function gemList(){
+  const r = await fetch(`${GEM}/models?pageSize=200`, { headers:{ 'x-goog-api-key': AG.key } });
+  if(!r.ok) throw new Error(await gemErr(r));
+  const j = await r.json();
+  return (j.models||[]).filter(m => (m.supportedGenerationMethods||[]).includes('generateContent'))
+    .map(m => m.name.replace('models/',''))
+    .filter(n => /gemini/.test(n) && !/(image|tts|audio|live|embed|vision|learnlm|robotics|computer)/.test(n));
+}
+function pickDefaultModel(list){
+  const score = n => { const v = parseFloat((n.match(/gemini-(\d+(\.\d+)?)/)||[])[1]||0);
+    return v*100 + (/flash/.test(n)?20:0) - (/lite/.test(n)?15:0) - (/(preview|exp)/.test(n)?5:0) - (/\d{3,}$|-\d{2}-\d{2}/.test(n)?2:0); };
+  return [...list].sort((a,b)=>score(b)-score(a))[0] || 'gemini-2.5-flash';
+}
+async function gemErr(r){
+  let msg = ''; try { msg = (await r.json())?.error?.message || ''; } catch(e){}
+  if(r.status===400 && /key/i.test(msg)) return 'Gemini rejected the API key. Check it in Agent settings.';
+  if(r.status===403) return 'Gemini refused the key (403). Make sure it is a Google AI Studio key with the Generative Language API enabled.';
+  if(r.status===429) return 'Gemini free-tier limit reached. Wait a minute and run again.';
+  if(r.status===404) return `Model not found. Pick another model in Agent settings. ${msg}`;
+  return `Gemini error ${r.status}: ${msg.slice(0,160)}`;
+}
+async function gemJSON(system, user, tries=2){
+  for(let t=0; t<tries; t++){
+    const r = await fetch(`${GEM}/models/${AG.model}:generateContent`, {
+      method:'POST', headers:{ 'Content-Type':'application/json', 'x-goog-api-key': AG.key },
+      body: JSON.stringify({ systemInstruction:{ parts:[{ text: system }] }, contents:[{ role:'user', parts:[{ text: user }] }],
+        generationConfig:{ responseMimeType:'application/json', temperature:0.35 } })
+    });
+    if(r.ok){
+      const j = await r.json();
+      const txt = (j.candidates?.[0]?.content?.parts||[]).map(p=>p.text||'').join('').replace(/^```(json)?|```$/gm,'').trim();
+      try { return JSON.parse(txt); }
+      catch(e){ const m = txt.match(/\{[\s\S]*\}/); if(m) try { return JSON.parse(m[0]); } catch(e2){} if(t===tries-1) throw new Error('Gemini returned an unreadable answer. Run again.'); }
+    } else if((r.status===429 || r.status>=500) && t<tries-1){ await new Promise(res=>setTimeout(res, 9000)); }
+    else throw new Error(await gemErr(r));
+  }
+}
+
+function statLine(games, f, line){
+  const v = games.map(f); const n = v.length; const hits = v.filter(x=>x>line).length;
+  return { n, hits, str: n ? `${hits}/${n}` : '0/0', rate: n ? hits/n : null };
+}
+function buildCandidates(maxN=40){
+  const out = [];
+  const outOn = tid => Object.values(S.players).filter(x=>x.teamId===tid && x.injury && /out/i.test(x.injury)).map(x=>x.name).slice(0,5);
+  for(const [id,P] of Object.entries(S.props)){
+    const p = S.players[id]; if(!p) continue;
+    if(p.injury && /out/i.test(p.injury)) continue;
+    const g = S.games.find(x=>x.id===P.gameId); if(!g || (g.status.state && g.status.state!=='pre')) continue;
+    const L = S.logs[id]; if(!L || L.status!=='ok' || L.games.length<8) continue;
+    const G = L.games, cur = G.filter(x=>x.season===S.season), prev = G.filter(x=>x.season===S.season-1);
+    const h2h = G.filter(x=>x.oppId===p.oppId);
+    for(const mk of MARKETS){
+      const m = P.markets[mk.key]; if(!m || m.line==null) continue;
+      const l5=statLine(G.slice(0,5),mk.f,m.line), l10=statLine(G.slice(0,10),mk.f,m.line), l20=statLine(G.slice(0,20),mk.f,m.line);
+      const sz=statLine(cur,mk.f,m.line), ls=statLine(prev,mk.f,m.line), hh=statLine(h2h,mk.f,m.line);
+      const blend = 0.35*l10.rate + 0.2*l20.rate + 0.25*(sz.n>=4?sz.rate:l20.rate) + 0.2*(ls.n>=10?ls.rate:l20.rate);
+      const side = blend>=0.5 ? 'Over' : 'Under', conf = side==='Over' ? blend : 1-blend;
+      const price = side==='Over' ? m.over : m.under;
+      if(isNaN(price) || price < -250) continue;
+      const v20 = G.slice(0,20).map(mk.f), a20 = avg(v20);
+      const sd = Math.sqrt(avg(v20.map(x=>(x-a20)**2)));
+      const fo = fairOver(m);
+      const def = S.defense?.teams?.[p.oppId];
+      const alts = (P.alts[mk.key]||[]).filter(a=>Math.abs(a.t-m.line)<=Math.max(3, m.line*0.25)).map(a=>`${a.t}+ ${fmtOdds(a.odds)}`);
+      out.push({ conf, c: {
+        id:'', pid:id, mkey:mk.key, player:p.name, pos:p.pos, team:p.team, opp:p.opp, venue:p.home?'home':'away',
+        tip: fmtTime(g.date), spread:g.spread||null, gameTotal:g.total||null,
+        market:mk.label, line:m.line, statLean:side, overOdds:m.over, underOdds:m.under,
+        openLine:m.openLine ?? m.line, openOver:isNaN(m.openOver)?null:m.openOver, openUnder:isNaN(m.openUnder)?null:m.openUnder,
+        noVigOverPct: fo==null?null:Math.round(fo*100),
+        overHits:{ L5:l5.str, L10:l10.str, L20:l20.str, thisSeason:sz.str, lastSeason:ls.str, vsOpp:hh.str },
+        avgL10:+avg(G.slice(0,10).map(mk.f)).toFixed(1), avgThisSeason: cur.length?+avg(cur.map(mk.f)).toFixed(1):null,
+        avgLastSeason: prev.length?+avg(prev.map(mk.f)).toFixed(1):null, sdL20:+sd.toFixed(1),
+        minL5:+avg(G.slice(0,5).map(x=>x.min)).toFixed(1), minThisSeason: cur.length?+avg(cur.map(x=>x.min)).toFixed(1):null,
+        restDays: Math.max(0, Math.round((g.date - G[0].date)/86400000) - 1),
+        oppDefRankVsMarket: def?.rank?.[mk.key] ?? null, oppAllowedPerGame: def?.val?.[mk.key]!=null ? +def.val[mk.key].toFixed(1) : null,
+        oppGamesPlayed: def?.gp ?? null, teammatesOut: outOn(p.teamId), opponentsOut: outOn(p.oppId),
+        injuryTag: p.injury || null, altLadder: alts
+      }});
+    }
+  }
+  out.sort((a,b)=>b.conf-a.conf);
+  const per = {}, picked = [];
+  for(const x of out){ if((per[x.c.pid]||0)>=2) continue; per[x.c.pid]=(per[x.c.pid]||0)+1; picked.push(x.c); if(picked.length>=maxN) break; }
+  picked.forEach((c,i)=>c.id='c'+(i+1));
+  return picked;
+}
+
+const AGENT_BASE = `You are part of "Agent Endzone: Hardwood", a private NBA player-prop research team working for one bettor who bets only at DraftKings.
+All data below is real, pulled tonight from ESPN and DraftKings. Hit counts like "7/10" mean how many of those games the player went OVER tonight's line (the same line applied to past games). restDays 0 = back-to-back. oppDefRankVsMarket: 1 = opponent allows the fewest of this stat (toughest), 30 = allows the most (softest). Early-season defense ranks use few games; weigh them lightly when oppGamesPlayed is small.
+Use only the data provided. Do not invent injuries, news, or stats. Be concise and specific. Respond with JSON only.`;
+
+const AGENT_PROMPTS = {
+  quinn: `You are Quinn, the Quant. Judge each prop purely on the numbers: hit rates across windows, sample size, recent form vs longer baseline, the gap between averages and the line relative to sdL20 (volatility), and minutes stability.
+For EVERY candidate return: {"notes":[{"id":"c1","lean":"Over|Under|Pass","prob":0-100 (your estimate that your lean hits),"grade":1-10 (statistical strength of the lean),"note":"max 20 words"}]}`,
+  scout: `You are Scout, the Matchup analyst. Judge each prop on context: opponent defense rank vs this stat, history vs this opponent, rest/back-to-back, injuries (teammates out usually raise usage and shot volume; opponents' missing players can soften the matchup), home/away, and blowout risk from the spread and game total (big spreads can cut starters' minutes).
+For EVERY candidate return: {"notes":[{"id":"c1","lean":"Over|Under|Pass","grade":1-10 (how strongly the matchup supports your lean),"note":"max 20 words"}]}`,
+  vig: `You are Vig, the Market analyst. Judge each prop on the DraftKings market: line and price movement from open to now (movement toward a side means money agrees with it), the juice on each side, the no-vig fair probability vs the hit rates, lines that look suspiciously low or high vs the averages (possible traps), and nearby alt-ladder prices.
+For EVERY candidate return: {"notes":[{"id":"c1","lean":"Over|Under|Pass","grade":1-10 (how strongly the market supports your lean),"note":"max 20 words"}]}`,
+  chief: n => `You are Chief, Mission Control. You get tonight's candidate props plus independent reports from Quinn (Quant), Scout (Matchup) and Vig (Market).
+Pick the ${n} props MOST LIKELY TO HIT, ranked by conviction (probability of hitting), NOT by price value. The bettor makes the final call, so be candid about risk.
+Rules: prefer picks where at least 2 of the 3 agents lean the same side; max one pick per player; avoid stacking several picks that depend on the same game script; skip anything with juice worse than -200 unless conviction is exceptional.
+Return: {"summary":"2 sentences on tonight's slate","picks":[{"id":"c1","side":"Over|Under","conviction":1-10,"hitPct":0-100,"agree":"3/3|2/3","headline":"max 10 words","why":"max 40 words, cite the specific numbers","risks":["short risk", "..."]}],"fades":[{"id":"cX","note":"max 15 words on why the team passed on a tempting prop"}]}`
+};
+
+async function runAgents(){
+  if(AG.running) return;
+  if(!AG.key){ AG.showSettings = true; AG.error = 'Add your free Gemini API key first.'; renderAgents(true); return; }
+  AG.running = true; AG.error = null; AG.result = null; AG.steps = { prep:'run' }; renderAgents(true);
+  try{
+    if(!AG.model){ try { AG.models = await gemList(); } catch(e){} AG.model = pickDefaultModel(AG.models); lsSet('dkat-gemini-model', AG.model); }
+    await Promise.all(Object.keys(S.props).map(id=>loadLog(id)));
+    if(!S.defense) await new Promise(res=>{ const t=setInterval(()=>{ if(S.defense){ clearInterval(t); res(); } }, 500); setTimeout(()=>{ clearInterval(t); res(); }, 20000); });
+    const cands = buildCandidates(40);
+    if(cands.length < 3) throw new Error('Not enough props with DraftKings lines for games that have not started yet. Try earlier in the day.');
+    AG.steps = { prep:'done', quinn:'run', scout:'run', vig:'run' }; renderAgents(true);
+    const data = JSON.stringify(cands.map(({pid,mkey,...c})=>c));
+    const ask = k => gemJSON(AGENT_BASE+'\n\n'+AGENT_PROMPTS[k], `Tonight's candidates (${cands.length}):\n${data}`)
+      .then(r=>{ AG.steps[k]='done'; renderAgents(true); return r; })
+      .catch(e=>{ AG.steps[k]='fail'; renderAgents(true); throw e; });
+    const [quinn, scout, vig] = await Promise.all(['quinn','scout','vig'].map(ask));
+    AG.steps.chief = 'run'; renderAgents(true);
+    const chief = await gemJSON(AGENT_BASE+'\n\n'+AGENT_PROMPTS.chief(AG.nPicks),
+      `Candidates:\n${data}\n\nQuinn report:\n${JSON.stringify(quinn)}\n\nScout report:\n${JSON.stringify(scout)}\n\nVig report:\n${JSON.stringify(vig)}`);
+    AG.steps.chief = 'done';
+    const byId = Object.fromEntries(cands.map(c=>[c.id,c]));
+    const noteMap = r => Object.fromEntries((r?.notes||[]).map(n=>[n.id,n]));
+    const Q = noteMap(quinn), Sc = noteMap(scout), V = noteMap(vig);
+    const picks = (chief?.picks||[]).filter(p=>byId[p.id]).map(p=>({ ...p, cand: byId[p.id], q:Q[p.id], s:Sc[p.id], v:V[p.id] }))
+      .sort((a,b)=>(b.conviction||0)-(a.conviction||0) || (b.hitPct||0)-(a.hitPct||0));
+    const fades = (chief?.fades||[]).filter(f=>byId[f.id]).map(f=>({ ...f, cand: byId[f.id] }));
+    if(!picks.length) throw new Error('Chief returned no usable picks. Run again.');
+    AG.result = { at: Date.now(), date: S.date, model: AG.model, summary: chief.summary||'', picks, fades, nCands: cands.length };
+    lsSet('dkat-agents-'+S.date, AG.result);
+  }catch(e){ AG.error = e.message || String(e); }
+  AG.running = false; renderAgents(true);
+}
+
+function renderAgents(force){
+  const el = $('agentPanel'); if(!el) return;
+  const ae = document.activeElement;
+  if(!force && ae && el.contains(ae) && (ae.tagName==='INPUT' || ae.tagName==='SELECT')) return;
+  if(!AG.result || AG.result.date!==S.date){ const c = lsGet('dkat-agents-'+S.date); AG.result = c && c.picks ? c : (AG.result?.date===S.date ? AG.result : null); }
+  const stepPill = k => { const st = AG.steps[k]; const a = AGENTS.find(x=>x.key===k);
+    const cls = st==='done' ? 'pill-hit' : st==='fail' ? 'pill-miss' : st==='run' ? 'pill-neut' : 'pill-dim';
+    return `<span class="pill ${cls}">${st==='run'?'<span class="spin mr-1.5" style="width:10px;height:10px"></span>':st==='done'?'✓ ':''}${a.name} · ${a.role}</span>`; };
+  const settings = `
+    <div class="mt-4 rounded-xl border border-slate-700 bg-slate-950/60 p-4 space-y-3">
+      <div class="text-sm font-semibold">Agent settings</div>
+      <label class="block text-xs text-slate-400">Gemini API key <span class="text-slate-500">(free at aistudio.google.com/apikey, saved only in this browser)</span>
+        <input id="agentKey" type="password" autocomplete="off" value="${esc(AG.key)}" placeholder="Paste your key" class="mt-1 w-full bg-slate-900 border border-slate-700 rounded-md px-3 py-2 font-mono text-sm outline-none focus:border-neon/60" /></label>
+      <div class="flex flex-wrap gap-3 items-end">
+        <label class="text-xs text-slate-400">Model
+          <select id="agentModel" class="mt-1 block bg-slate-900 border border-slate-700 rounded-md px-2 py-2 text-sm min-w-[200px]">
+            <option value="">Auto (best Flash model)</option>
+            ${[...new Set([...(AG.models||[]), AG.model].filter(Boolean))].map(m=>`<option value="${esc(m)}" ${m===AG.model?'selected':''}>${esc(m)}</option>`).join('')}
+          </select></label>
+        <label class="text-xs text-slate-400">Picks
+          <select id="agentN" class="mt-1 block bg-slate-900 border border-slate-700 rounded-md px-2 py-2 text-sm">
+            ${[5,8,10,12].map(n=>`<option ${n==AG.nPicks?'selected':''}>${n}</option>`).join('')}
+          </select></label>
+        <button id="agentLoadModels" class="text-xs border border-slate-700 hover:border-neon/60 rounded-md px-3 py-2">Load model list</button>
+        <button id="agentSave" class="text-xs font-bold bg-neon text-slate-950 rounded-md px-4 py-2">Save</button>
+      </div>
+    </div>`;
+  const R = AG.result;
+  const gradeChip = (lab, n) => n ? `<span class="text-[10px] font-mono px-1.5 py-0.5 rounded ${n.lean && n.lean!=='Pass'?'bg-slate-800 text-slate-300':'bg-slate-900 text-slate-500'}" title="${esc(n.note||'')}">${lab} ${n.grade??'–'}${n.lean&&n.lean!=='Pass'?' '+n.lean[0]:''}</span>` : '';
+  const pickCard = (p, i) => {
+    const c = p.cand, price = p.side==='Over' ? c.overOdds : c.underOdds;
+    const conv = Math.max(0, Math.min(10, +p.conviction||0));
+    const col = conv>=8 ? '#39ff88' : conv>=6 ? '#facc15' : '#f87171';
+    return `<button data-pick="${i}" class="text-left rounded-xl border border-slate-700 hover:border-neon/60 bg-slate-900/60 p-4 flex flex-col gap-2 transition min-w-0">
+      <div class="flex items-start justify-between gap-2">
+        <div class="min-w-0"><div class="text-[11px] font-mono text-slate-500">#${i+1} · ${esc(c.team)} ${c.venue==='home'?'vs':'@'} ${esc(c.opp)} · ${esc(c.tip)}</div>
+          <div class="font-extrabold text-base leading-tight truncate">${esc(c.player)}</div></div>
+        <div class="text-right shrink-0"><div class="text-2xl font-extrabold font-mono leading-none" style="color:${col}">${conv}<span class="text-xs text-slate-500">/10</span></div><div class="text-[10px] text-slate-500 font-mono">${p.hitPct!=null?p.hitPct+'% hit':''}</div></div>
+      </div>
+      <div class="flex items-center gap-2 flex-wrap"><span class="pill ${p.side==='Over'?'pill-hit':'pill-miss'}">${esc(p.side)} ${c.line} ${esc(c.market)}</span><span class="font-mono text-sm">${fmtOdds(price)}</span><span class="text-[10px] text-slate-500 font-mono">${esc(p.agree||'')} agree</span></div>
+      ${p.headline?`<div class="text-sm font-semibold text-slate-200">${esc(p.headline)}</div>`:''}
+      <div class="text-xs text-slate-400 leading-relaxed">${esc(p.why||'')}</div>
+      ${(p.risks||[]).length?`<div class="text-[11px] text-yellow-300/80">Risk: ${esc(p.risks.join(' · '))}</div>`:''}
+      <div class="flex gap-1.5 flex-wrap mt-auto pt-1">${gradeChip('Quinn',p.q)}${gradeChip('Scout',p.s)}${gradeChip('Vig',p.v)}</div>
+    </button>`;
+  };
+  const reports = R ? `<div class="mt-4 overflow-x-auto scroll-thin"><table class="w-full text-xs"><thead><tr class="text-left text-[10px] uppercase tracking-wider text-slate-500 border-b border-slate-800"><th class="py-2 pr-2">Pick</th><th class="py-2 pr-2">Quinn (Quant)</th><th class="py-2 pr-2">Scout (Matchup)</th><th class="py-2">Vig (Market)</th></tr></thead><tbody>
+      ${R.picks.map(p=>`<tr class="border-b border-slate-800/60 align-top"><td class="py-2 pr-2 font-semibold whitespace-nowrap">${esc(p.cand.player.split(' ').slice(-1)[0])} ${esc(p.side[0])} ${p.cand.line} ${esc(p.cand.market)}</td>${[p.q,p.s,p.v].map(n=>`<td class="py-2 pr-2 text-slate-400 min-w-[160px]">${n?`<b class="text-slate-300">${esc(n.lean||'')} ${n.grade??''}/10${n.prob!=null?' · '+n.prob+'%':''}</b> ${esc(n.note||'')}`:'—'}</td>`).join('')}</tr>`).join('')}
+    </tbody></table>
+    ${R.fades?.length?`<div class="mt-3 text-xs text-slate-400"><span class="font-semibold text-slate-300">Passed on:</span> ${R.fades.map(f=>`${esc(f.cand.player)} ${esc(f.cand.market)} ${f.cand.line} (${esc(f.note||'')})`).join(' · ')}</div>`:''}</div>` : '';
+  const hasSlate = S.games.some(g=>!g.status.state || g.status.state==='pre') && Object.keys(S.props).length;
+  el.innerHTML = `
+    <div class="flex flex-wrap items-center gap-3">
+      <div class="flex items-center gap-3 min-w-0">
+        <div class="w-9 h-9 rounded-lg bg-neon/15 border border-neon/40 grid place-items-center text-neon font-mono font-bold text-xs shrink-0">AI</div>
+        <div class="min-w-0"><h3 class="font-extrabold tracking-tight">Agent Picks</h3>
+          <div class="text-[11px] text-slate-500 font-mono truncate">${R?`Ran ${new Date(R.at).toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'})} · ${R.nCands} props screened · ${esc(R.model)}`:'Quinn, Scout and Vig scout tonight’s board, Chief ranks the picks most likely to hit'}</div></div>
+      </div>
+      <div class="ml-auto flex items-center gap-2">
+        ${R?`<button id="agentCopy" class="text-xs border border-slate-700 hover:border-neon/60 rounded-md px-3 py-2">Copy picks</button>`:''}
+        <button id="agentGear" class="text-xs border border-slate-700 hover:border-neon/60 rounded-md px-3 py-2">Settings</button>
+        <button id="agentRun" ${AG.running||!hasSlate?'disabled':''} class="text-sm font-bold rounded-md px-4 py-2 ${AG.running||!hasSlate?'bg-slate-800 text-slate-500':'bg-neon text-slate-950 hover:brightness-110'}">${AG.running?'Agents working…':R?'Run again':'Run agent team'}</button>
+      </div>
+    </div>
+    ${AG.running || Object.keys(AG.steps).length && !R ? `<div class="flex flex-wrap gap-2 mt-4">${['quinn','scout','vig','chief'].map(stepPill).join('')}</div>` : ''}
+    ${AG.error?`<div class="mt-3 text-sm text-red-400">${esc(AG.error)}</div>`:''}
+    ${!hasSlate && !R && !S.loadingSlate ? `<div class="mt-3 text-xs text-slate-500">No upcoming games with DraftKings props right now. The agents run on games that haven't tipped off yet.</div>`:''}
+    ${AG.showSettings || !AG.key ? settings : ''}
+    ${R?`${R.summary?`<p class="mt-4 text-sm text-slate-300">${esc(R.summary)}</p>`:''}
+      <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3 mt-4">${R.picks.map(pickCard).join('')}</div>
+      <div class="mt-3 flex flex-wrap items-center gap-3 text-[11px] text-slate-500"><button id="agentReports" class="underline hover:text-slate-300">${AG.showReports?'Hide':'Show'} full agent reports</button><span>Conviction = the team's confidence the pick hits, not a guarantee. Tap a pick to open its breakdown. You make the final call.</span></div>
+      ${AG.showReports?reports:''}`:''}
+  `;
+  // wire
+  const on = (id, f) => { const b = $(id); if(b) b.onclick = f; };
+  on('agentRun', runAgents);
+  on('agentGear', ()=>{ AG.showSettings = !AG.showSettings; renderAgents(true); });
+  on('agentReports', ()=>{ AG.showReports = !AG.showReports; renderAgents(true); });
+  on('agentSave', ()=>{ AG.key = $('agentKey').value.trim(); AG.model = $('agentModel').value; AG.nPicks = +$('agentN').value || 8;
+    lsSet('dkat-gemini-key', AG.key); lsSet('dkat-gemini-model', AG.model); lsSet('dkat-agent-npicks', AG.nPicks);
+    AG.showSettings = false; AG.error = null; renderAgents(true); });
+  on('agentLoadModels', async ()=>{ const k = $('agentKey').value.trim(); if(!k){ AG.error='Paste your Gemini key first.'; renderAgents(true); return; }
+    AG.key = k; try { AG.models = await gemList(); AG.error = null; if(!AG.model) AG.model = pickDefaultModel(AG.models); } catch(e){ AG.error = e.message; } AG.showSettings = true; renderAgents(true); });
+  on('agentCopy', async ()=>{
+    const txt = `Agent Picks ${R.date}\n` + R.picks.map((p,i)=>`${i+1}. ${p.cand.player} ${p.side} ${p.cand.line} ${p.cand.market} (${fmtOdds(p.side==='Over'?p.cand.overOdds:p.cand.underOdds)}) · conviction ${p.conviction}/10 · ${p.why||''}`).join('\n');
+    try { await navigator.clipboard.writeText(txt); $('agentCopy').textContent='Copied'; } catch(e){ $('agentCopy').textContent='Copy failed'; } });
+  el.querySelectorAll('[data-pick]').forEach(b=>b.onclick=()=>{ const p = R.picks[+b.dataset.pick]; S.market = p.cand.mkey; S.gameFilter='all'; selectPlayer(p.cand.pid); $('detail').scrollIntoView({behavior:'smooth', block:'start'}); });
 }
 
 // ===== SEARCH =====
