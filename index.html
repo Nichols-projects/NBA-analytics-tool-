@@ -103,7 +103,7 @@
 
   <footer class="text-center text-[11px] text-slate-600 py-6 leading-relaxed">
     Live data: ESPN public feeds (DraftKings is ESPN's odds provider). Not affiliated with DraftKings, ESPN or the NBA. Lines can move or be pulled at any time, so confirm in the DK app before betting.<br/>
-    For research and entertainment. Gambling problem? Call 1-800-GAMBLER. · <span class="font-mono">v1.4</span>
+    For research and entertainment. Gambling problem? Call 1-800-GAMBLER. · <span class="font-mono">v1.5</span>
   </footer>
 </main>
 
@@ -301,12 +301,13 @@ async function loadDefense(){
   const days = [];
   for(let d=new Date(start); d<today; d.setDate(d.getDate()+1)) days.push(ymd(d));
   const results = await Promise.all(days.map(day => limit(async ()=>{
-    const key = 'dkat-sb-'+day;
+    const key = 'dkat-sb2-'+day;
     const cached = lsGet(key);
     if(cached) return cached;
     try{
       const j = await getJSON(`${ESPN}/scoreboard?dates=${day}`);
       const evs = (j.events||[]).filter(e=>e.season?.type===2 && e.status?.type?.completed).map(e=>({
+        id: e.id, date: e.date,
         teams: e.competitions[0].competitors.map(c=>{
           const st = Object.fromEntries((c.statistics||[]).map(x=>[x.name, parseFloat(x.displayValue)]));
           return { id:c.team.id, abbr:c.team.abbreviation, pts:+c.score||0, reb:st.rebounds||0, ast:st.assists||0,
@@ -341,7 +342,96 @@ async function loadDefense(){
     sorted.forEach((t,i)=>{ D.teams[t.id].val[k]=f(t); D.teams[t.id].rank[k]=i+1; });
   }
   S.defense = D;
+  S.seasonEvents = results.flat().filter(e=>e.id);
   scheduleRender();
+  loadBoxScores();
+}
+
+// ===== BOX SCORES: defense vs position, pace, with/without splits =====
+const BOX = { status:'idle', done:0, total:0, games:{} };
+function posGroup(p){ p = String(p||'').toUpperCase(); if(p.includes('C')) return 'C'; if(p.startsWith('G') || p==='PG' || p==='SG') return 'G'; return 'F'; }
+function parseBox(j, ev){
+  const sp = v => String(v||'0-0').split('-').map(Number);
+  const teams = (j.boxscore?.players||[]).map(tp=>{
+    const st = tp.statistics?.[0]; if(!st || !tp.team) return null;
+    const k = st.keys||[], ix = n => k.indexOf(n);
+    const tstat = (j.boxscore.teams||[]).find(t=>t.team?.id===tp.team.id);
+    const ts = Object.fromEntries((tstat?.statistics||[]).map(x=>[x.name, x.displayValue]));
+    const [,fga] = sp(ts['fieldGoalsMade-fieldGoalsAttempted']), [,fta] = sp(ts['freeThrowsMade-freeThrowsAttempted']);
+    return { id: tp.team.id,
+      poss: fga + 0.44*fta - (+ts.offensiveRebounds||0) + (+ts.totalTurnovers || +ts.turnovers || 0),
+      pl: (st.athletes||[]).map(a=>{
+        const s = a.stats||[], min = parseFloat(s[ix('minutes')])||0, pos = posGroup(a.athlete?.position?.abbreviation);
+        if(!min) return [a.athlete?.id, pos, 0];
+        return [a.athlete?.id, pos, min, +s[ix('points')]||0, +s[ix('rebounds')]||0, +s[ix('assists')]||0, sp(s[ix('threePointFieldGoalsMade-threePointFieldGoalsAttempted')])[0]];
+      }) };
+  }).filter(Boolean);
+  return teams.length===2 ? { d: ev.date, t: teams } : null;
+}
+async function loadBoxScores(){
+  if(BOX.status==='loading') return;
+  const evs = S.seasonEvents||[]; if(!evs.length) return;
+  const tonight = new Set(S.games.flatMap(g=>[g.home.id, g.away.id]));
+  const order = [...evs].sort((a,b)=>(b.teams.some(t=>tonight.has(t.id))?1:0) - (a.teams.some(t=>tonight.has(t.id))?1:0));
+  BOX.status = 'loading'; BOX.total = order.length; BOX.done = 0;
+  await Promise.all(order.map(ev => limit(async ()=>{
+    if(!BOX.games[ev.id]){
+      let bx = lsGet('dkat-bx-'+ev.id);
+      if(!bx){ try { bx = parseBox(await getJSON(`${ESPN}/summary?event=${ev.id}`), ev); if(bx) lsSet('dkat-bx-'+ev.id, bx); } catch(e){} }
+      if(bx) BOX.games[ev.id] = bx;
+    }
+    BOX.done++; if(BOX.done % 15 === 0) scheduleRender();
+  })));
+  computeMatchups(); BOX.status = 'ready'; scheduleRender();
+}
+function computeMatchups(){
+  const P = {}, PACE = {}, z = () => ({ pts:0, reb:0, ast:0, fg3:0 });
+  for(const bx of Object.values(BOX.games)){
+    const [A,B] = bx.t, pace = (A.poss + B.poss)/2;
+    for(const [me,op] of [[A,B],[B,A]]){
+      const pc = (PACE[me.id] ??= { n:0, sum:0 }); pc.n++; pc.sum += pace;
+      const d = (P[me.id] ??= { gp:0, G:z(), F:z(), C:z() }); d.gp++;
+      for(const pl of op.pl){ if(!pl[2]) continue; const g = d[pl[1]]; g.pts+=pl[3]; g.reb+=pl[4]; g.ast+=pl[5]; g.fg3+=pl[6]; }
+    }
+  }
+  const teams = Object.keys(P), out = { pos:{}, pace:{} };
+  const comb = { pts:g=>g.pts, reb:g=>g.reb, ast:g=>g.ast, fg3:g=>g.fg3, pra:g=>g.pts+g.reb+g.ast, pr:g=>g.pts+g.reb, pa:g=>g.pts+g.ast, ra:g=>g.reb+g.ast };
+  for(const pos of ['G','F','C']) for(const [k,f] of Object.entries(comb)){
+    const val = t => f(P[t][pos]) / P[t].gp;
+    [...teams].sort((a,b)=>val(a)-val(b)).forEach((t,i)=>{   // rank 1 = allows the fewest (toughest)
+      const o = ((out.pos[t] ??= { gp:P[t].gp })[pos] ??= { val:{}, rank:{} }); o.val[k] = val(t); o.rank[k] = i+1; });
+  }
+  Object.keys(PACE).sort((a,b)=>PACE[b].sum/PACE[b].n - PACE[a].sum/PACE[a].n)
+    .forEach((t,i)=> out.pace[t] = { pace: PACE[t].sum/PACE[t].n, rank: i+1 }); // rank 1 = fastest
+  S.match = out;
+}
+function withWithout(pid, teamId, mkey){
+  if(BOX.status!=='ready') return [];
+  const outs = Object.values(S.players).filter(x=>x.teamId===teamId && x.id!==pid && x.injury && /out/i.test(x.injury));
+  if(!outs.length) return [];
+  const f = MK[mkey].f;
+  const games = Object.values(BOX.games).map(bx=>bx.t.find(t=>t.id===teamId)).filter(Boolean);
+  return outs.map(o=>{
+    const w = [], wo = [];
+    for(const t of games){
+      const me = t.pl.find(x=>x[0]===pid); if(!me || !me[2]) continue;
+      const v = f({ pts:me[3], reb:me[4], ast:me[5], fg3:me[6] });
+      const tm = t.pl.find(x=>x[0]===o.id); (tm && tm[2] ? w : wo).push(v);
+    }
+    return { teammate:o.name, gamesWithout:wo.length, avgWithout: wo.length?+avg(wo).toFixed(1):null, gamesWith:w.length, avgWith: w.length?+avg(w).toFixed(1):null, valsWithout:wo };
+  }).filter(x=>x.gamesWithout || x.gamesWith);
+}
+function matchupFor(p, mkey){
+  const pg = posGroup(p.pos), pr = S.match?.pos?.[p.oppId]?.[pg], def = S.defense?.teams?.[p.oppId];
+  const op = S.match?.pace?.[p.oppId], mp = S.match?.pace?.[p.teamId];
+  const parts = [];
+  if(pr) parts.push([0.55, (pr.rank[mkey]-1)/29]);
+  if(def?.rank?.[mkey]) parts.push([0.2, (def.rank[mkey]-1)/29]);
+  if(op && mp) parts.push([0.25, (60 - op.rank - mp.rank)/58]);
+  const wsum = parts.reduce((s,x)=>s+x[0],0);
+  return { pg, posRank: pr?.rank?.[mkey] ?? null, posAllowed: pr?.val?.[mkey]!=null ? +pr.val[mkey].toFixed(1) : null,
+    oppPace: op ? +op.pace.toFixed(1) : null, oppPaceRank: op?.rank ?? null, teamPaceRank: mp?.rank ?? null,
+    score: wsum ? parts.reduce((s,x)=>s+x[0]*x[1],0)/wsum : null };
 }
 
 // ===== ANALYTICS =====
@@ -502,6 +592,7 @@ function renderDetail(){
       <div class="card p-5">${altHTML(id, sp, mk)}</div>
       <div class="card p-5">${defenseHTML(p, mk)}</div>
     </div>
+    <div class="card p-5">${matchupHTML(id, p, mk)}</div>
     <div class="card p-5">${loading ? '' : shootingHTML(p, sp)}</div>
   `;
   wireDetail(id);
@@ -705,6 +796,33 @@ function altHTML(id, sp, mk){
     <tbody>${rows}</tbody></table></div>`;
 }
 
+function matchupHTML(id, p, mk){
+  const head = `<h3 class="font-bold text-sm uppercase tracking-wider text-slate-400 mb-1">Matchup Lab · ${esc(p.name.split(' ').slice(-1)[0])} vs ${esc(p.opp)}</h3>`;
+  if(BOX.status!=='ready' || !S.match) return head + `<div class="py-6 text-center text-slate-500 text-sm"><span class="spin"></span><div class="mt-2 text-xs">Loading this season's box scores (${BOX.done}/${BOX.total||'…'}). First load takes a minute, then it's saved on this device.</div></div>`;
+  const pg = posGroup(p.pos), PN = { G:'guards', F:'forwards', C:'centers' }[pg];
+  const pr = S.match.pos[p.oppId]?.[pg];
+  const op = S.match.pace[p.oppId], mp = S.match.pace[p.teamId];
+  const cell = (k, lab) => { const r = pr?.rank?.[k]; return `<div class="rounded-lg border bg-slate-900/60 p-3 ${k===mk.key?'ring-1 ring-neon/60':''}" style="border-color:${rankColor(r)}55">
+      <div class="text-[10px] uppercase tracking-wider text-slate-500">${lab}</div>
+      <div class="flex items-end justify-between mt-1"><span class="text-xl font-extrabold font-mono">${pr?.val?.[k]!=null?pr.val[k].toFixed(1):'—'}</span><span class="pill ${rankClass(r)}">#${r??'—'}</span></div></div>`; };
+  const ww = withWithout(id, p.teamId, mk.key);
+  const wwRows = ww.map(w=>{ const d = (w.avgWithout!=null && w.avgWith!=null) ? w.avgWithout - w.avgWith : null;
+    return `<tr class="border-b border-slate-800/60"><td class="py-2 pr-2 font-semibold">${esc(w.teammate)} <span class="text-[10px] text-red-400">OUT</span></td>
+      <td class="py-2 pr-2 font-mono">${w.gamesWithout ? `${w.avgWithout} <span class="text-slate-500">(${w.gamesWithout}g)</span>` : '—'}</td>
+      <td class="py-2 pr-2 font-mono">${w.gamesWith ? `${w.avgWith} <span class="text-slate-500">(${w.gamesWith}g)</span>` : '—'}</td>
+      <td class="py-2 font-mono ${d==null?'text-slate-500':d>=0?'text-neon':'text-red-400'}">${d==null ? (w.gamesWith? '—' : 'out all season') : (d>=0?'+':'')+d.toFixed(1)}</td></tr>`; }).join('');
+  return head + `<p class="text-[11px] text-slate-500 mb-3">What ${esc(p.opp)} allows per game to opposing <b class="text-slate-300">${PN}</b> this season (from ${pr?S.match.pos[p.oppId].gp:0} box scores). Rank 30 = allows the most (best for Overs).</p>
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-2">${cell('pts','Points')}${cell('reb','Rebounds')}${cell('ast','Assists')}${cell('fg3','Threes')}</div>
+    <div class="grid grid-cols-2 gap-2 mt-2">
+      <div class="rounded-lg border border-slate-700 bg-slate-900/60 p-3"><div class="text-[10px] uppercase tracking-wider text-slate-500">${esc(p.opp)} pace</div><div class="flex items-end justify-between mt-1"><span class="text-xl font-extrabold font-mono">${op?op.pace.toFixed(1):'—'}</span><span class="pill ${op?(op.rank<=10?'pill-fav':op.rank>=21?'pill-tough':'pill-neut'):'pill-dim'}">#${op?.rank??'—'}</span></div></div>
+      <div class="rounded-lg border border-slate-700 bg-slate-900/60 p-3"><div class="text-[10px] uppercase tracking-wider text-slate-500">${esc(p.team)} pace</div><div class="flex items-end justify-between mt-1"><span class="text-xl font-extrabold font-mono">${mp?mp.pace.toFixed(1):'—'}</span><span class="pill ${mp?(mp.rank<=10?'pill-fav':mp.rank>=21?'pill-tough':'pill-neut'):'pill-dim'}">#${mp?.rank??'—'}</span></div></div>
+    </div>
+    <p class="text-[10px] text-slate-500 mt-1">Pace = possessions per game, rank 1 = fastest. Faster games mean more stats to go around.</p>
+    <div class="mt-4"><div class="text-[11px] uppercase tracking-wider text-slate-500 mb-1">${mk.label} with and without teammates out tonight</div>
+      ${ww.length ? `<div class="overflow-x-auto scroll-thin"><table class="w-full text-sm"><thead><tr class="text-left text-[10px] uppercase tracking-wider text-slate-500 border-b border-slate-800"><th class="py-1.5 pr-2">Teammate</th><th class="py-1.5 pr-2">Without</th><th class="py-1.5 pr-2">With</th><th class="py-1.5">Change</th></tr></thead><tbody>${wwRows}</tbody></table></div>` : `<div class="text-xs text-slate-500">No teammates ruled out tonight.</div>`}
+    </div>`;
+}
+
 function defenseHTML(p, mk){
   const head = `<h3 class="font-bold text-sm uppercase tracking-wider text-slate-400 mb-1">${esc(p.opp)} Defense Profile</h3>`;
   if(!S.defense) return head + `<div class="py-8 text-center text-slate-500 text-sm"><span class="spin"></span><div class="mt-2 text-xs">Crunching every box score this season…</div></div>`;
@@ -794,8 +912,9 @@ const AG = {
   models: [], showSettings: false, running: false, steps: {}, error: null, results: {}, resultsDate: null, runningGame: null, showReports: false, open: true
 };
 const AGENTS = [
+  { key:'recon', name:'Scout', role:'Live recon' },
   { key:'quinn', name:'Quinn', role:'Quant' },
-  { key:'scout', name:'Scout', role:'Matchup' },
+  { key:'scout', name:'Scout', role:'Matchup lead' },
   { key:'vig',   name:'Vig',   role:'Market' },
   { key:'chief', name:'Chief', role:'Mission Control' },
 ];
@@ -830,7 +949,7 @@ async function gemErr(r){
   if(r.status===503) return 'Google\u2019s Gemini servers are overloaded on every free model right now. Try again in a few minutes.';
   return `Gemini error ${r.status}: ${msg.slice(0,160)}`;
 }
-async function gemJSON(system, user, who){
+async function gemJSON(system, user, who, opts={}){
   // Exponential backoff per model (2s, 5s, 12s), then fall back to the next model.
   const wait = ms => new Promise(res=>setTimeout(res, ms));
   const delays = [2000, 5000, 12000];
@@ -842,12 +961,14 @@ async function gemJSON(system, user, who){
       try {
         r = await fetch(`${GEM}/models/${model}:generateContent`, {
           method:'POST', headers:{ 'Content-Type':'application/json', 'x-goog-api-key': AG.key },
-          body: JSON.stringify({ systemInstruction:{ parts:[{ text: system }] }, contents:[{ role:'user', parts:[{ text: user }] }],
-            generationConfig:{ responseMimeType:'application/json', temperature:0.35 } })
+          body: JSON.stringify(opts.search
+            ? { contents:[{ role:'user', parts:[{ text: user }] }], tools:[{ google_search:{} }], generationConfig:{ temperature:0.2 } }
+            : { systemInstruction:{ parts:[{ text: system }] }, contents:[{ role:'user', parts:[{ text: user }] }], generationConfig:{ responseMimeType:'application/json', temperature:0.35 } })
         });
       } catch(e){ lastErr = new Error('Could not reach Gemini. Check your internet connection.'); if(t<delays.length){ await wait(delays[t]); continue; } break; }
       if(r.ok){
         const j = await r.json();
+        if(opts.search){ const t = (j.candidates?.[0]?.content?.parts||[]).map(p=>p.text||'').join('').trim(); if(t){ AG.usedModel = AG.usedModel || model; AG.status=''; return t; } lastErr = new Error('Recon came back empty.'); break; }
         const txt = (j.candidates?.[0]?.content?.parts||[]).map(p=>p.text||'').join('').replace(/^```(json)?|```$/gm,'').trim();
         let out = null;
         try { out = JSON.parse(txt); } catch(e){ const m = txt.match(/\{[\s\S]*\}/); if(m) try { out = JSON.parse(m[0]); } catch(e2){} }
@@ -885,15 +1006,20 @@ function buildCandidates(gameId, maxN=25){
       const l5=statLine(G.slice(0,5),mk.f,m.line), l10=statLine(G.slice(0,10),mk.f,m.line), l20=statLine(G.slice(0,20),mk.f,m.line);
       const sz=statLine(cur,mk.f,m.line), ls=statLine(prev,mk.f,m.line), hh=statLine(h2h,mk.f,m.line);
       const blend = 0.35*l10.rate + 0.2*l20.rate + 0.25*(sz.n>=4?sz.rate:l20.rate) + 0.2*(ls.n>=10?ls.rate:l20.rate);
-      const conf = blend;                                    // Overs only: rank by how often he clears the line
       const price = m.over;
-      if(isNaN(price) || price < -250 || l10.rate < 0.3) continue;
+      if(isNaN(price) || price < -250 || l10.rate < 0.2) continue;
+      const mu = matchupFor(p, mk.key);
+      const ww = withWithout(id, p.teamId, mk.key);
+      // usage boost: production without a teammate who is out tonight (only counts when he has also played WITH him this season)
+      let boost = 0;
+      ww.forEach(x=>{ if(x.gamesWithout>=2 && x.gamesWith>=2) boost += Math.max(-0.15, Math.min(0.25, (x.avgWithout - x.avgWith)/Math.max(2, m.line))); });
+      const conf = 0.45*blend + 0.4*(mu.score ?? 0.5) + 0.15*(0.5 + boost);   // matchup-first blend
       const v20 = G.slice(0,20).map(mk.f), a20 = avg(v20);
       const sd = Math.sqrt(avg(v20.map(x=>(x-a20)**2)));
       const fo = fairOver(m);
       const def = S.defense?.teams?.[p.oppId];
       const alts = (P.alts[mk.key]||[]).filter(a=>Math.abs(a.t-m.line)<=Math.max(3, m.line*0.25)).map(a=>`${a.t}+ ${fmtOdds(a.odds)}`);
-      out.push({ conf, c: {
+      out.push({ conf, mscore: mu.score ?? 0, c: {
         id:'', pid:id, mkey:mk.key, player:p.name, pos:p.pos, team:p.team, opp:p.opp, venue:p.home?'home':'away',
         tip: fmtTime(g.date), spread:g.spread||null, gameTotal:g.total||null,
         market:mk.label, line:m.line, side:'Over', overOdds:m.over, underOdds:m.under,
@@ -906,34 +1032,59 @@ function buildCandidates(gameId, maxN=25){
         restDays: Math.max(0, Math.round((g.date - G[0].date)/86400000) - 1),
         oppDefRankVsMarket: def?.rank?.[mk.key] ?? null, oppAllowedPerGame: def?.val?.[mk.key]!=null ? +def.val[mk.key].toFixed(1) : null,
         oppGamesPlayed: def?.gp ?? null, teammatesOut: outOn(p.teamId), opponentsOut: outOn(p.oppId),
-        injuryTag: p.injury || null, altLadder: alts
+        injuryTag: p.injury || null, altLadder: alts,
+        positionGroup: mu.pg, oppPosRankVsMarket: mu.posRank, oppAllowedToPosPerGame: mu.posAllowed,
+        oppPace: mu.oppPace, oppPaceRank: mu.oppPaceRank, teamPaceRank: mu.teamPaceRank,
+        matchupScore: mu.score==null ? null : Math.round(mu.score*100), trendScore: Math.round(blend*100),
+        withoutTeammates: ww.map(({valsWithout, ...x})=>({ ...x, overHitsWithout: `${valsWithout.filter(v=>v>m.line).length}/${valsWithout.length}` }))
       }});
     }
   }
+  const per = {}, picked = [], take = x => { if(picked.includes(x.c) || (per[x.c.pid]||0)>=2) return; per[x.c.pid]=(per[x.c.pid]||0)+1; picked.push(x.c); };
+  [...out].sort((a,b)=>b.mscore-a.mscore).slice(0,6).forEach(take);          // best matchups always get a look, even if he's cold
   out.sort((a,b)=>b.conf-a.conf);
-  const per = {}, picked = [];
-  for(const x of out){ if((per[x.c.pid]||0)>=2) continue; per[x.c.pid]=(per[x.c.pid]||0)+1; picked.push(x.c); if(picked.length>=maxN) break; }
+  for(const x of out){ if(picked.length>=maxN) break; take(x); }
   picked.forEach((c,i)=>c.id='c'+(i+1));
   return picked;
 }
 
-const AGENT_BASE = `You are part of "Agent Endzone: Hardwood", a private NBA player-prop research team working for one bettor who bets only at DraftKings.
-The bettor only plays OVERS. Every candidate is an Over bet; judge only whether the Over hits, never recommend an Under.
-All data below is real, pulled tonight from ESPN and DraftKings for ONE game. Hit counts like "7/10" mean how many of those games the player went OVER tonight's line (the same line applied to past games). restDays 0 = back-to-back. oppDefRankVsMarket: 1 = opponent allows the fewest of this stat (toughest), 30 = allows the most (softest). Early-season defense ranks use few games; weigh them lightly when oppGamesPlayed is small.
-Use only the data provided. Do not invent injuries, news, or stats. Be concise and specific. Respond with JSON only.`;
+const AGENT_BASE = `You are part of "Agent Endzone: Hardwood", a private NBA player-prop research team working for one bettor who bets only at DraftKings and only plays OVERS. Every candidate is an Over bet; judge only whether the Over hits. Never recommend an Under.
+The team's philosophy: MATCHUP FIRST. A prop is worth playing when tonight's specific matchup, pace, role and game script push the player's production up, not just because he hit recently. Recent trends are supporting evidence, never the main reason.
+All data is real, pulled tonight from ESPN box scores and DraftKings for ONE game. Field guide:
+- positionGroup: G, F or C. oppPosRankVsMarket: how the opponent ranks in this stat allowed to players at HIS position (1 = allows the fewest, toughest; 30 = allows the most, softest). oppAllowedToPosPerGame: that stat allowed per game to his position group.
+- oppDefRankVsMarket / oppAllowedPerGame: same idea for the whole team, not position-specific.
+- oppPace / oppPaceRank and teamPaceRank: possessions per game (rank 1 = fastest). Two fast teams = more possessions = more counting stats.
+- withoutTeammates: his production THIS SEASON in games without each teammate ruled out tonight (gamesWithout, avgWithout, overHitsWithout vs gamesWith, avgWith). If gamesWith is 0 the absence is already baked into his recent numbers; if gamesWith > 0 it is a NEW absence and the usage shift matters.
+- overHits like "7/10": games he went OVER tonight's line (same line applied to past games). restDays 0 = back-to-back. spread/gameTotal hint at game script and blowout risk.
+- matchupScore (0-100, higher = friendlier) and trendScore (0-100) are the app's own quick formulas; form your own view.
+- recon (when present): live notes from a web search tonight about injuries, lineups and each team's defensive scheme. Trust it for news; ignore anything it marks as not found.
+Early-season ranks use small samples; say so when it matters. Use only the data provided, never invent stats or news. Be concise and specific. Respond with JSON only.`;
 
 const AGENT_PROMPTS = {
-  quinn: `You are Quinn, the Quant. Judge each prop purely on the numbers: hit rates across windows, sample size, recent form vs longer baseline, the gap between averages and the line relative to sdL20 (volatility), and minutes stability.
-For EVERY candidate return: {"notes":[{"id":"c1","lean":"Over|Pass","prob":0-100 (your estimate that the Over hits),"grade":1-10 (statistical strength of the lean),"note":"max 20 words"}]}`,
-  scout: `You are Scout, the Matchup analyst. Judge each prop on context: opponent defense rank vs this stat, history vs this opponent, rest/back-to-back, injuries (teammates out usually raise usage and shot volume; opponents' missing players can soften the matchup), home/away, and blowout risk from the spread and game total (big spreads can cut starters' minutes).
-For EVERY candidate return: {"notes":[{"id":"c1","lean":"Over|Pass","grade":1-10 (how strongly the matchup supports the Over),"note":"max 20 words"}]}`,
-  vig: `You are Vig, the Market analyst. Judge each prop on the DraftKings market: line and price movement from open to now (movement toward a side means money agrees with it), the juice on each side, the no-vig fair probability vs the hit rates, lines that look suspiciously low or high vs the averages (possible traps), and nearby alt-ladder prices.
-For EVERY candidate return: {"notes":[{"id":"c1","lean":"Over|Pass","grade":1-10 (how strongly the market supports the Over),"note":"max 20 words"}]}`,
-  chief: n => `You are Chief, Mission Control. You get one game's candidate OVER props plus independent reports from Quinn (Quant), Scout (Matchup) and Vig (Market).
-Pick the ${n} OVERS in this game MOST LIKELY TO HIT (fewer if fewer are worth it), ranked by conviction (probability of hitting), NOT by price value. The bettor makes the final call, so be candid about risk.
-Rules: Overs only, never an Under; prefer picks where at least 2 of the 3 agents lean Over; the headline must name the same stat and line as the pick; max one pick per player; avoid stacking several picks that depend on the same game script; skip anything with juice worse than -200 unless conviction is exceptional.
-Return: {"summary":"2 sentences on how this game sets up for Overs","picks":[{"id":"c1","side":"Over","conviction":1-10,"hitPct":0-100 (chance the Over hits),"agree":"3/3|2/3","headline":"max 10 words","why":"max 40 words, cite the specific numbers","risks":["short risk", "..."]}],"fades":[{"id":"cX","note":"max 15 words on why the team passed on a tempting prop"}]}`
+  scout: `You are Scout, the LEAD Matchup analyst. Your grade carries the most weight with Chief.
+Build every read in this order: (1) position matchup: oppPosRankVsMarket and oppAllowedToPosPerGame for his position and this stat; (2) pace of both teams; (3) usage shifts from injuries using withoutTeammates, NEW absences first; (4) defensive scheme and late news from recon (examples: drop coverage gives ball handlers pull-up looks and lets bigs rebound; switch-heavy teams invite isolation scoring; zone limits rim attempts and gives up threes; elite rim protection hurts interior scorers; poor defensive rebounding helps opposing bigs); (5) game script: spread, total, blowout risk to his minutes; (6) rest. Use trends only as a tiebreaker.
+Grade 8-10 only when the matchup actively boosts the Over. Grade 4 or lower when the matchup works against it, however hot he is.
+For EVERY candidate return: {"notes":[{"id":"c1","lean":"Over|Pass","grade":1-10,"keyFactor":"position|pace|usage|scheme|script|rest","note":"max 25 words, cite the matchup numbers"}]}`,
+  quinn: `You are Quinn, the Quant and the team's sanity check, not the driver. For each prop ask: is tonight's line inside his realistic range? Use averages vs line relative to sdL20 (volatility), minutes stability (minL5 vs minThisSeason), sample sizes, and whether the withoutTeammates numbers are a real sample or noise. Flag props where the matchup story needs a level of production he rarely reaches.
+For EVERY candidate return: {"notes":[{"id":"c1","lean":"Over|Pass","prob":0-100 (chance the Over hits),"grade":1-10,"note":"max 20 words"}]}`,
+  vig: `You are Vig, the Market analyst. Judge each Over on the DraftKings market: line and price movement from open to now (movement toward the Over means money agrees), juice, no-vig fair probability vs your read, lines that look set low or high vs his averages and matchup (possible traps), and nearby alt-ladder prices.
+For EVERY candidate return: {"notes":[{"id":"c1","lean":"Over|Pass","grade":1-10,"note":"max 20 words"}]}`,
+  chief: n => `You are Chief, Mission Control. You get one game's candidate OVER props, live recon notes, and reports from Scout (Matchup, lead), Quinn (Quant) and Vig (Market).
+Pick up to ${n} OVERS most likely to hit, ranked by conviction (probability of hitting), not price value. Fewer is fine if fewer are worth it. The bettor makes the final call, so be candid.
+Weighting: Scout 50%, Quinn 30%, Vig 20%. Rules:
+- Every pick needs a concrete matchup or usage reason (Scout grade 6 or higher). Never pick on recent trend alone.
+- Drop any player the recon says is out, doubtful or on a minutes limit.
+- Overs only. Max one pick per player. Avoid stacking picks that all need the same game script. Skip juice worse than -200 unless conviction is exceptional.
+- The headline must name the same stat and line as the pick. "why" must cite the matchup numbers (position rank, pace, with/without, scheme) and at most one trend number.
+Return: {"summary":"2 sentences on how this matchup sets up for Overs","picks":[{"id":"c1","side":"Over","conviction":1-10,"hitPct":0-100 (chance the Over hits),"agree":"3/3|2/3","keyFactor":"position|pace|usage|scheme|script","headline":"max 10 words","why":"max 45 words","risks":["short risk"]}],"fades":[{"id":"cX","note":"max 15 words on why the team passed on a tempting prop"}]}`
 };
+const RECON_PROMPT = (g, date) => `Use Google Search to research tonight's NBA game: ${g.away.name} at ${g.home.name} on ${date}.
+In under 180 words of plain text, cover:
+1) Injury report: who is out, doubtful or questionable on each team, plus any minutes restrictions.
+2) Lineup news: projected starters or rotation changes.
+3) Defensive scheme for each team this season: pick-and-roll coverage (drop, switch, hedge/blitz), zone usage, rim protection, and which positions or player types they struggle to guard.
+4) Pace and style notes.
+Only state what the search results support. Write "not found" for anything you cannot confirm. No betting advice.`;
 
 async function runAgents(){
   if(AG.running) return;
@@ -945,17 +1096,26 @@ async function runAgents(){
     if(!AG.model){ try { AG.models = await gemList(); } catch(e){} AG.model = pickDefaultModel(AG.models); }
     await Promise.all(Object.keys(S.props).map(id=>loadLog(id)));
     if(!S.defense) await new Promise(res=>{ const t=setInterval(()=>{ if(S.defense){ clearInterval(t); res(); } }, 500); setTimeout(()=>{ clearInterval(t); res(); }, 20000); });
+    if(BOX.status!=='ready') await new Promise(res=>{ const t=setInterval(()=>{ AG.status = `Loading this season's box scores for matchup data (${BOX.done}/${BOX.total})…`; renderAgents(true); if(BOX.status==='ready'){ clearInterval(t); res(); } }, 1000); setTimeout(()=>{ clearInterval(t); res(); }, 150000); });
+    if(BOX.status==='ready' && !S.match) computeMatchups();
     if(game.status.state && game.status.state!=='pre') throw new Error(`${game.short} has already started. DraftKings pulls pregame props at tip-off.`);
     const cands = buildCandidates(gameId, 25);
     if(cands.length < 2) throw new Error(`Not enough Over props with DraftKings lines for ${game.short} yet. DK usually posts them the day of the game.`);
     AG.steps = { prep:'done' }; renderAgents(true);
     const data = JSON.stringify(cands.map(({pid,mkey,...c})=>c));
+    // 1) live recon via Google Search (optional: the run continues without it)
+    let recon = null;
+    AG.steps.recon = 'run'; renderAgents(true);
+    try { recon = await gemJSON('', RECON_PROMPT(game, new Date(game.date).toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric'})), 'Scout recon', { search:true }); AG.steps.recon = 'done'; }
+    catch(e){ if(/API key|refused the key/i.test(e.message)) throw e; AG.steps.recon = 'fail'; recon = null; }
+    renderAgents(true);
+    const ctx = `${game.short} Over candidates (${cands.length}):\n${data}\n\nrecon (live web search notes):\n${recon || 'unavailable tonight'}`;
     const NAMES = { quinn:'Quinn', scout:'Scout', vig:'Vig' };
     const reports = {};
-    for(const [i,k] of ['quinn','scout','vig'].entries()){       // one at a time, so Gemini isn't hit all at once
-      if(i) await new Promise(res=>setTimeout(res, 1500));
+    for(const k of ['scout','quinn','vig']){                      // one at a time, so Gemini isn't hit all at once
+      await new Promise(res=>setTimeout(res, 1500));
       AG.steps[k] = 'run'; renderAgents(true);
-      try { reports[k] = await gemJSON(AGENT_BASE+'\n\n'+AGENT_PROMPTS[k], `${game.short} Over candidates (${cands.length}):\n${data}`, NAMES[k]); AG.steps[k]='done'; }
+      try { reports[k] = await gemJSON(AGENT_BASE+'\n\n'+AGENT_PROMPTS[k], ctx, NAMES[k]); AG.steps[k]='done'; }
       catch(e){ AG.steps[k]='fail'; renderAgents(true); throw e; }
       renderAgents(true);
     }
@@ -963,7 +1123,7 @@ async function runAgents(){
     await new Promise(res=>setTimeout(res, 1500));
     AG.steps.chief = 'run'; renderAgents(true);
     const chief = await gemJSON(AGENT_BASE+'\n\n'+AGENT_PROMPTS.chief(AG.nPicks),
-      `Candidates:\n${data}\n\nQuinn report:\n${JSON.stringify(quinn)}\n\nScout report:\n${JSON.stringify(scout)}\n\nVig report:\n${JSON.stringify(vig)}`, 'Chief');
+      `${ctx}\n\nScout report (lead):\n${JSON.stringify(scout)}\n\nQuinn report:\n${JSON.stringify(quinn)}\n\nVig report:\n${JSON.stringify(vig)}`, 'Chief');
     AG.steps.chief = 'done';
     const byId = Object.fromEntries(cands.map(c=>[c.id,c]));
     const noteMap = r => Object.fromEntries((r?.notes||[]).map(n=>[n.id,n]));
@@ -973,7 +1133,7 @@ async function runAgents(){
       .sort((a,b)=>(b.conviction||0)-(a.conviction||0) || (b.hitPct||0)-(a.hitPct||0));
     const fades = (chief?.fades||[]).filter(f=>byId[f.id]).map(f=>({ ...f, cand: byId[f.id] }));
     if(!picks.length) throw new Error('Chief found no Overs worth taking in this game. Try another game or run again.');
-    AG.results[gameId] = { at: Date.now(), date: S.date, gameId, game: game.short, model: AG.usedModel || AG.model, summary: chief.summary||'', picks: picks.slice(0, AG.nPicks), fades, nCands: cands.length };
+    AG.results[gameId] = { at: Date.now(), date: S.date, gameId, game: game.short, model: AG.usedModel || AG.model, summary: chief.summary||'', picks: picks.slice(0, AG.nPicks), fades, nCands: cands.length, recon };
     lsSet('dkat-agents2-'+S.date, AG.results);
   }catch(e){ AG.error = e.message || String(e); }
   AG.running = false; AG.runningGame = null; renderAgents(true);
@@ -1008,6 +1168,16 @@ function renderAgents(force){
         <button id="agentSave" class="text-xs font-bold bg-neon text-slate-950 rounded-md px-4 py-2">Save</button>
       </div>
     </div>`;
+  const matchChips = (c, kf) => {
+    const chip = (t, r, good) => `<span class="text-[10px] font-mono px-1.5 py-0.5 rounded border" style="border-color:${good==null?'#334155':good?'#39ff8866':'#f8717166'};color:${good==null?'#94a3b8':good?'#39ff88':'#f87171'}">${t}</span>`;
+    const out = [];
+    if(c.oppPosRankVsMarket) out.push(chip(`vs ${c.positionGroup}s #${c.oppPosRankVsMarket}`, 0, c.oppPosRankVsMarket>=21 ? true : c.oppPosRankVsMarket<=10 ? false : null));
+    if(c.oppPaceRank) out.push(chip(`pace #${c.oppPaceRank}`, 0, c.oppPaceRank<=10 ? true : c.oppPaceRank>=21 ? false : null));
+    (c.withoutTeammates||[]).filter(w=>w.gamesWith>0 && w.gamesWithout>0 && w.avgWithout!=null && w.avgWith!=null).slice(0,1)
+      .forEach(w=>{ const d = w.avgWithout - w.avgWith; out.push(chip(`w/o ${esc(w.teammate.split(' ').slice(-1)[0])} ${d>=0?'+':''}${d.toFixed(1)}`, 0, d>0)); });
+    if(kf) out.push(`<span class="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-800 text-slate-300">key: ${esc(kf)}</span>`);
+    return out.length ? `<div class="flex gap-1.5 flex-wrap">${out.join('')}</div>` : '';
+  };
   const gradeChip = (lab, n) => n ? `<span class="text-[10px] font-mono px-1.5 py-0.5 rounded ${n.lean && n.lean!=='Pass'?'bg-slate-800 text-slate-300':'bg-slate-900 text-slate-500'}" title="${esc(n.note||'')}">${lab} ${n.grade??'–'}${n.lean&&n.lean!=='Pass'?' '+n.lean[0]:''}</span>` : '';
   const pickCard = (p, i) => {
     const c = p.cand, price = p.side==='Over' ? c.overOdds : c.underOdds;
@@ -1020,14 +1190,15 @@ function renderAgents(force){
         <div class="text-right shrink-0"><div class="text-2xl font-extrabold font-mono leading-none" style="color:${col}">${conv}<span class="text-xs text-slate-500">/10</span></div><div class="text-[10px] text-slate-500 font-mono">${p.hitPct!=null?p.hitPct+'% to hit':''}</div></div>
       </div>
       <div class="flex items-center gap-2 flex-wrap"><span class="pill ${p.side==='Over'?'pill-hit':'pill-miss'}">${esc(p.side)} ${c.line} ${esc(c.market)}</span><span class="font-mono text-sm">${fmtOdds(price)}</span><span class="text-[10px] text-slate-500 font-mono">${esc(p.agree||'')} agree</span></div>
+      ${matchChips(c, p.keyFactor)}
       ${p.headline?`<div class="text-sm font-semibold text-slate-200">${esc(p.headline)}</div>`:''}
       <div class="text-xs text-slate-400 leading-relaxed">${esc(p.why||'')}</div>
       ${(p.risks||[]).length?`<div class="text-[11px] text-yellow-300/80">Risk: ${esc(p.risks.join(' · '))}</div>`:''}
-      <div class="flex gap-1.5 flex-wrap mt-auto pt-1">${gradeChip('Quinn',p.q)}${gradeChip('Scout',p.s)}${gradeChip('Vig',p.v)}</div>
+      <div class="flex gap-1.5 flex-wrap mt-auto pt-1">${gradeChip('Scout',p.s)}${gradeChip('Quinn',p.q)}${gradeChip('Vig',p.v)}</div>
     </button>`;
   };
-  const reports = R ? `<div class="mt-4 overflow-x-auto scroll-thin"><table class="w-full text-xs"><thead><tr class="text-left text-[10px] uppercase tracking-wider text-slate-500 border-b border-slate-800"><th class="py-2 pr-2">Pick</th><th class="py-2 pr-2">Quinn (Quant)</th><th class="py-2 pr-2">Scout (Matchup)</th><th class="py-2">Vig (Market)</th></tr></thead><tbody>
-      ${R.picks.map(p=>`<tr class="border-b border-slate-800/60 align-top"><td class="py-2 pr-2 font-semibold whitespace-nowrap">${esc(p.cand.player.split(' ').slice(-1)[0])} ${esc(p.side[0])} ${p.cand.line} ${esc(p.cand.market)}</td>${[p.q,p.s,p.v].map(n=>`<td class="py-2 pr-2 text-slate-400 min-w-[160px]">${n?`<b class="text-slate-300">${esc(n.lean||'')} ${n.grade??''}/10${n.prob!=null?' · '+n.prob+'%':''}</b> ${esc(n.note||'')}`:'—'}</td>`).join('')}</tr>`).join('')}
+  const reports = R ? `${R.recon?`<div class="mt-4 rounded-lg border border-slate-800 bg-slate-950/50 p-3"><div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Scout's live recon (Google Search)</div><div class="text-xs text-slate-300 whitespace-pre-line leading-relaxed">${esc(R.recon)}</div></div>`:`<div class="mt-4 text-[11px] text-slate-500">Live recon was unavailable for this run.</div>`}<div class="mt-4 overflow-x-auto scroll-thin"><table class="w-full text-xs"><thead><tr class="text-left text-[10px] uppercase tracking-wider text-slate-500 border-b border-slate-800"><th class="py-2 pr-2">Pick</th><th class="py-2 pr-2">Scout (Matchup lead)</th><th class="py-2 pr-2">Quinn (Quant)</th><th class="py-2">Vig (Market)</th></tr></thead><tbody>
+      ${R.picks.map(p=>`<tr class="border-b border-slate-800/60 align-top"><td class="py-2 pr-2 font-semibold whitespace-nowrap">${esc(p.cand.player.split(' ').slice(-1)[0])} ${esc(p.side[0])} ${p.cand.line} ${esc(p.cand.market)}</td>${[p.s,p.q,p.v].map(n=>`<td class="py-2 pr-2 text-slate-400 min-w-[160px]">${n?`<b class="text-slate-300">${esc(n.lean||'')} ${n.grade??''}/10${n.prob!=null?' · '+n.prob+'%':''}${n.keyFactor?' · '+esc(n.keyFactor):''}</b> ${esc(n.note||'')}`:'—'}</td>`).join('')}</tr>`).join('')}
     </tbody></table>
     ${R.fades?.length?`<div class="mt-3 text-xs text-slate-400"><span class="font-semibold text-slate-300">Passed on:</span> ${R.fades.map(f=>`${esc(f.cand.player)} ${esc(f.cand.market)} ${f.cand.line} (${esc(f.note||'')})`).join(' · ')}</div>`:''}</div>` : '';
   const pre = g => !g.status.state || g.status.state==='pre';
@@ -1039,7 +1210,7 @@ function renderAgents(force){
       <div class="flex items-center gap-3 min-w-0">
         <div class="w-9 h-9 rounded-lg bg-neon/15 border border-neon/40 grid place-items-center text-neon font-mono font-bold text-xs shrink-0">AI</div>
         <div class="min-w-0"><h3 class="font-extrabold tracking-tight">Agent Picks</h3>
-          <div class="text-[11px] text-slate-500 font-mono truncate">${R?`Ran ${new Date(R.at).toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'})} · ${esc(R.game)} · ${R.nCands} Overs screened · ${esc(R.model)}`:'Overs only, one game at a time: pick a game, then run the team'}</div></div>
+          <div class="text-[11px] text-slate-500 font-mono truncate">${R?`Ran ${new Date(R.at).toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'})} · ${esc(R.game)} · ${R.nCands} Overs screened · ${esc(R.model)}`:'Overs only, matchup first: pick a game, then run the team'}</div></div>
       </div>
       <div class="ml-auto flex flex-wrap items-center gap-2">
         ${R?`<button id="agentCopy" class="text-xs border border-slate-700 hover:border-neon/60 rounded-md px-3 py-2">Copy picks</button>`:''}
@@ -1048,7 +1219,7 @@ function renderAgents(force){
         <button id="agentRun" ${canRun?'':'disabled'} class="text-sm font-bold rounded-md px-4 py-2 whitespace-nowrap ${canRun?'bg-neon text-slate-950 hover:brightness-110':'bg-slate-800 text-slate-500'}">${runLabel}</button>
       </div>
     </div>
-    ${AG.running || (Object.keys(AG.steps).length && !R && AG.lastGame===S.gameFilter) ? `<div class="flex flex-wrap gap-2 mt-4">${['quinn','scout','vig','chief'].map(stepPill).join('')}</div>` : ''}
+    ${AG.running || (Object.keys(AG.steps).length && !R && AG.lastGame===S.gameFilter) ? `<div class="flex flex-wrap gap-2 mt-4">${['recon','scout','quinn','vig','chief'].map(stepPill).join('')}</div>` : ''}
     ${AG.running && AG.status?`<div class="mt-3 text-xs font-mono text-slate-400">${esc(AG.status)}</div>`:''}
     ${AG.error?`<div class="mt-3 text-sm text-red-400">${esc(AG.error)}</div>`:''}
     ${!gSel && !AG.running && Object.keys(AG.results).length ? `<div class="mt-3 flex flex-wrap gap-2 text-xs"><span class="text-slate-500 self-center">Already run today:</span>${Object.values(AG.results).map(r=>`<button data-rg="${r.gameId}" class="pill pill-hit">${esc(r.game)} · ${r.picks.length}</button>`).join('')}</div>` : ''}
