@@ -1,0 +1,33 @@
+name: NBA.com daily data
+
+on:
+  schedule:
+    - cron: "37 14 * * *"     # every morning, about 7:37 AM Arizona time
+  workflow_dispatch:           # "Run workflow" button on the Actions tab
+  push:
+    paths:
+      - "scripts/fetch_nba_com.py"
+      - ".github/workflows/nba-data.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download NBA.com stats
+        run: python scripts/fetch_nba_com.py
+      - name: Save nba-com.json to the repo
+        run: |
+          git config user.name "nba-data-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add nba-com.json
+          git diff --cached --quiet && echo "No changes" && exit 0
+          git commit -m "Update NBA.com data"
+          git push

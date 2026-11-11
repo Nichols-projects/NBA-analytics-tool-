@@ -103,7 +103,7 @@
 
   <footer class="text-center text-[11px] text-slate-600 py-6 leading-relaxed">
     Live data: ESPN public feeds (DraftKings is ESPN's odds provider). Not affiliated with DraftKings, ESPN or the NBA. Lines can move or be pulled at any time, so confirm in the DK app before betting.<br/>
-    For research and entertainment. Gambling problem? Call 1-800-GAMBLER. · <span class="font-mono">v1.5</span>
+    For research and entertainment. Gambling problem? Call 1-800-GAMBLER. · <span class="font-mono">v1.6</span>
   </footer>
 </main>
 
@@ -421,6 +421,34 @@ function withWithout(pid, teamId, mkey){
     return { teammate:o.name, gamesWithout:wo.length, avgWithout: wo.length?+avg(wo).toFixed(1):null, gamesWith:w.length, avgWith: w.length?+avg(w).toFixed(1):null, valsWithout:wo };
   }).filter(x=>x.gamesWithout || x.gamesWith);
 }
+// ===== NBA.COM DATA (play types, tracking, shot zones, usage; refreshed each morning by the GitHub job) =====
+const NBACOM_URLS = ['https://raw.githubusercontent.com/Nichols-projects/NBA-analytics-tool-/main/nba-com.json', 'nba-com.json'];
+const PT_LABEL = { Isolation:'Isolation', Transition:'Transition', PRBallHandler:'P&R ball handler', PRRollman:'P&R roll man', Postup:'Post-up', Spotup:'Spot-up', Handoff:'Handoff', Cut:'Cut', OffScreen:'Off screen', OffRebound:'Putbacks' };
+const ZONE_LABEL = { RA:'Restricted area', PAINT:'Paint (non-RA)', MID:'Mid-range', LC3:'Left corner 3', RC3:'Right corner 3', C3:'Corner 3', AB3:'Above-break 3' };
+async function loadNbaCom(){
+  for(const u of NBACOM_URLS){
+    try { const r = await fetch(u + '?h=' + Math.floor(Date.now()/3600000)); if(r.ok){ const j = await r.json(); if(j && j.players){ S.nbacom = j; scheduleRender(); return; } } } catch(e){}
+  }
+}
+const normName = n => String(n||'').normalize('NFKD').replace(/[̀-ͯ]/g,'').toLowerCase().replace(/-/g,' ').replace(/[^a-z ]/g,'')
+  .split(/\s+/).filter(w=>w && !['jr','sr','ii','iii','iv','v'].includes(w)).join(' ');
+function nbaFor(p){ return S.nbacom?.players?.[normName(p.name)] || null; }
+function nbaSummary(p){
+  const n = nbaFor(p); if(!n) return null;
+  const td = S.nbacom.teams?.[p.opp] || {};
+  const playTypes = Object.entries(n.pt||{}).sort((a,b)=>(b[1][0]||0)-(a[1][0]||0)).slice(0,4).map(([k,v])=>({
+    playType: PT_LABEL[k]||k, freqPct: v[0]!=null ? Math.round(v[0]*100) : null, ppp: v[1], ptsPerGame: v[2],
+    oppDefPPP: td.ptDef?.[k]?.[0] ?? null, oppDefRank: td.ptDef?.[k]?.[1] ?? null }));
+  const zEntries = Object.entries(n.zones||{}).filter(([k])=>!(k==='C3' && (n.zones.LC3 || n.zones.RC3)));
+  const totalFga = zEntries.reduce((t,[,z])=>t+(z[0]||0),0);
+  const shotZones = zEntries.sort((a,b)=>(b[1][0]||0)-(a[1][0]||0)).slice(0,4).map(([k,v])=>({
+    zone: ZONE_LABEL[k]||k, key:k, fgaPerGame: v[0], shareOfShotsPct: totalFga ? Math.round((v[0]||0)/totalFga*100) : null,
+    fgPct: v[1]!=null ? Math.round(v[1]*100) : null,
+    oppFgPctAllowed: td.zoneDef?.[k]?.[1]!=null ? Math.round(td.zoneDef[k][1]*100) : null, oppZoneRank: td.zoneDef?.[k]?.[2] ?? null }));
+  return { playTypes, tracking: n.trk || null, shotZones,
+    usagePct: n.usg!=null ? +(n.usg*100).toFixed(1) : null, usagePctL5: n.usgL5!=null ? +(n.usgL5*100).toFixed(1) : null };
+}
+
 function matchupFor(p, mkey){
   const pg = posGroup(p.pos), pr = S.match?.pos?.[p.oppId]?.[pg], def = S.defense?.teams?.[p.oppId];
   const op = S.match?.pace?.[p.oppId], mp = S.match?.pace?.[p.teamId];
@@ -818,9 +846,28 @@ function matchupHTML(id, p, mk){
       <div class="rounded-lg border border-slate-700 bg-slate-900/60 p-3"><div class="text-[10px] uppercase tracking-wider text-slate-500">${esc(p.team)} pace</div><div class="flex items-end justify-between mt-1"><span class="text-xl font-extrabold font-mono">${mp?mp.pace.toFixed(1):'—'}</span><span class="pill ${mp?(mp.rank<=10?'pill-fav':mp.rank>=21?'pill-tough':'pill-neut'):'pill-dim'}">#${mp?.rank??'—'}</span></div></div>
     </div>
     <p class="text-[10px] text-slate-500 mt-1">Pace = possessions per game, rank 1 = fastest. Faster games mean more stats to go around.</p>
+    ${nbaComHTML(p)}
     <div class="mt-4"><div class="text-[11px] uppercase tracking-wider text-slate-500 mb-1">${mk.label} with and without teammates out tonight</div>
       ${ww.length ? `<div class="overflow-x-auto scroll-thin"><table class="w-full text-sm"><thead><tr class="text-left text-[10px] uppercase tracking-wider text-slate-500 border-b border-slate-800"><th class="py-1.5 pr-2">Teammate</th><th class="py-1.5 pr-2">Without</th><th class="py-1.5 pr-2">With</th><th class="py-1.5">Change</th></tr></thead><tbody>${wwRows}</tbody></table></div>` : `<div class="text-xs text-slate-500">No teammates ruled out tonight.</div>`}
     </div>`;
+}
+
+function nbaComHTML(p){
+  if(!S.nbacom) return `<div class="mt-4 text-[11px] text-slate-500">NBA.com play types, tracking and shot zones appear here once the daily NBA.com job has run.</div>`;
+  const n = nbaSummary(p);
+  const asOf = `<span class="text-slate-600 normal-case tracking-normal"> · NBA.com, updated ${esc(new Date(S.nbacom.updated).toLocaleDateString('en-US',{month:'short',day:'numeric'}))}</span>`;
+  if(!n) return `<div class="mt-4 text-[11px] text-slate-500">No NBA.com data found for ${esc(p.name)} yet.</div>`;
+  const ptRows = n.playTypes.map(t=>`<tr class="border-b border-slate-800/60"><td class="py-1.5 pr-2 font-semibold">${esc(t.playType)}</td><td class="py-1.5 pr-2 font-mono">${t.freqPct??'—'}%</td><td class="py-1.5 pr-2 font-mono">${t.ptsPerGame??'—'}</td><td class="py-1.5 pr-2 font-mono">${t.ppp??'—'}</td><td class="py-1.5"><span class="pill ${rankClass(t.oppDefRank)}">#${t.oppDefRank??'—'}</span> <span class="text-[10px] font-mono text-slate-500">${t.oppDefPPP??''}</span></td></tr>`).join('');
+  const zRows = n.shotZones.map(z=>`<tr class="border-b border-slate-800/60"><td class="py-1.5 pr-2 font-semibold">${esc(z.zone)}</td><td class="py-1.5 pr-2 font-mono">${z.shareOfShotsPct??'—'}%</td><td class="py-1.5 pr-2 font-mono">${z.fgPct??'—'}%</td><td class="py-1.5"><span class="pill ${rankClass(z.oppZoneRank)}">#${z.oppZoneRank??'—'}</span> <span class="text-[10px] font-mono text-slate-500">${z.oppFgPctAllowed!=null?z.oppFgPctAllowed+'%':''}</span></td></tr>`).join('');
+  const t = n.tracking || {};
+  const chip = (lab, v) => v==null ? '' : `<div class="rounded-lg border border-slate-700 bg-slate-900/60 px-3 py-2"><div class="text-[10px] uppercase tracking-wider text-slate-500">${lab}</div><div class="font-mono font-bold">${v}</div></div>`;
+  const th = cols => `<thead><tr class="text-left text-[10px] uppercase tracking-wider text-slate-500 border-b border-slate-800">${cols.map(c=>`<th class="py-1.5 pr-2">${c}</th>`).join('')}</tr></thead>`;
+  return `<div class="mt-4"><div class="text-[11px] uppercase tracking-wider text-slate-500 mb-1">Play types vs ${esc(p.opp)} defense${asOf}</div>
+      ${ptRows ? `<div class="overflow-x-auto scroll-thin"><table class="w-full text-sm">${th(['Play type','Freq','PTS','PPP',`${esc(p.opp)} D rank`])}<tbody>${ptRows}</tbody></table></div>` : `<div class="text-xs text-slate-500">No play-type data yet.</div>`}</div>
+    <div class="mt-4"><div class="text-[11px] uppercase tracking-wider text-slate-500 mb-1">Shot zones vs ${esc(p.opp)} defense</div>
+      ${zRows ? `<div class="overflow-x-auto scroll-thin"><table class="w-full text-sm">${th(['Zone','Share','His FG%',`${esc(p.opp)} D rank`])}<tbody>${zRows}</tbody></table></div>` : `<div class="text-xs text-slate-500">No shot-zone data yet.</div>`}
+      <p class="text-[10px] text-slate-500 mt-1">D rank 30 = that defense gives up the most there (best for Overs).</p></div>
+    <div class="mt-4 grid grid-cols-2 sm:grid-cols-4 gap-2">${chip('Usage', n.usagePct!=null?`${n.usagePct}%${n.usagePctL5!=null?` <span class="text-[10px] ${n.usagePctL5>=n.usagePct?'text-neon':'text-red-400'}">L5 ${n.usagePctL5}%</span>`:''}`:null)}${chip('Rebound chances', t.rebChances)}${chip('Potential assists', t.potAst)}${chip('Touches', t.touches)}${chip('Drives', t.drives)}${chip('Catch & shoot FGA', t.csFga)}${chip('Pull-up FGA', t.puFga)}</div>`;
 }
 
 function defenseHTML(p, mk){
@@ -1036,6 +1083,7 @@ function buildCandidates(gameId, maxN=25){
         positionGroup: mu.pg, oppPosRankVsMarket: mu.posRank, oppAllowedToPosPerGame: mu.posAllowed,
         oppPace: mu.oppPace, oppPaceRank: mu.oppPaceRank, teamPaceRank: mu.teamPaceRank,
         matchupScore: mu.score==null ? null : Math.round(mu.score*100), trendScore: Math.round(blend*100),
+        nbaCom: nbaSummary(p),
         withoutTeammates: ww.map(({valsWithout, ...x})=>({ ...x, overHitsWithout: `${valsWithout.filter(v=>v>m.line).length}/${valsWithout.length}` }))
       }});
     }
@@ -1057,15 +1105,16 @@ All data is real, pulled tonight from ESPN box scores and DraftKings for ONE gam
 - withoutTeammates: his production THIS SEASON in games without each teammate ruled out tonight (gamesWithout, avgWithout, overHitsWithout vs gamesWith, avgWith). If gamesWith is 0 the absence is already baked into his recent numbers; if gamesWith > 0 it is a NEW absence and the usage shift matters.
 - overHits like "7/10": games he went OVER tonight's line (same line applied to past games). restDays 0 = back-to-back. spread/gameTotal hint at game script and blowout risk.
 - matchupScore (0-100, higher = friendlier) and trendScore (0-100) are the app's own quick formulas; form your own view.
+- nbaCom (when present, from NBA.com): playTypes = his main play types (freqPct of his possessions, ppp = points per possession) vs the opponent's defense on that play type (oppDefPPP allowed and oppDefRank: 1 = allows the fewest points per possession, toughest; 30 = most, softest). shotZones = where he shoots (share of his shots, his FG%) vs the opponent's FG% allowed in that zone (oppZoneRank 1 = toughest, 30 = softest). tracking: rebChances = rebound opportunities per game (the volume behind rebound props), potAst = potential assists per game (passes that led to shots; far above his assists means assists should rise), touches, drives, catch-and-shoot and pull-up attempts. usagePct vs usagePctL5 shows whether his role is growing.
 - recon (when present): live notes from a web search tonight about injuries, lineups and each team's defensive scheme. Trust it for news; ignore anything it marks as not found.
 Early-season ranks use small samples; say so when it matters. Use only the data provided, never invent stats or news. Be concise and specific. Respond with JSON only.`;
 
 const AGENT_PROMPTS = {
   scout: `You are Scout, the LEAD Matchup analyst. Your grade carries the most weight with Chief.
-Build every read in this order: (1) position matchup: oppPosRankVsMarket and oppAllowedToPosPerGame for his position and this stat; (2) pace of both teams; (3) usage shifts from injuries using withoutTeammates, NEW absences first; (4) defensive scheme and late news from recon (examples: drop coverage gives ball handlers pull-up looks and lets bigs rebound; switch-heavy teams invite isolation scoring; zone limits rim attempts and gives up threes; elite rim protection hurts interior scorers; poor defensive rebounding helps opposing bigs); (5) game script: spread, total, blowout risk to his minutes; (6) rest. Use trends only as a tiebreaker.
-Grade 8-10 only when the matchup actively boosts the Over. Grade 4 or lower when the matchup works against it, however hot he is.
-For EVERY candidate return: {"notes":[{"id":"c1","lean":"Over|Pass","grade":1-10,"keyFactor":"position|pace|usage|scheme|script|rest","note":"max 25 words, cite the matchup numbers"}]}`,
-  quinn: `You are Quinn, the Quant and the team's sanity check, not the driver. For each prop ask: is tonight's line inside his realistic range? Use averages vs line relative to sdL20 (volatility), minutes stability (minL5 vs minThisSeason), sample sizes, and whether the withoutTeammates numbers are a real sample or noise. Flag props where the matchup story needs a level of production he rarely reaches.
+Build every read in this order: (1) position matchup: oppPosRankVsMarket and oppAllowedToPosPerGame for his position and this stat; (1b) when nbaCom is present: his top play types vs the opponent's rank guarding them, his main shot zones vs their zone defense, and for rebound/assist props the tracking volume (rebChances, potAst); (2) pace of both teams; (3) usage shifts from injuries using withoutTeammates, NEW absences first; (4) defensive scheme and late news from recon (examples: drop coverage gives ball handlers pull-up looks and lets bigs rebound; switch-heavy teams invite isolation scoring; zone limits rim attempts and gives up threes; elite rim protection hurts interior scorers; poor defensive rebounding helps opposing bigs); (5) game script: spread, total, blowout risk to his minutes; (6) rest. Use trends only as a tiebreaker.
+Grade 8-10 only when the matchup actively boosts the Over (for example: his #1 play type faces a bottom-5 defense of it, or his main zone faces a soft zone defense). Grade 4 or lower when the matchup works against it, however hot he is.
+For EVERY candidate return: {"notes":[{"id":"c1","lean":"Over|Pass","grade":1-10,"keyFactor":"position|playtype|zone|tracking|pace|usage|scheme|script|rest","note":"max 25 words, cite the matchup numbers"}]}`,
+  quinn: `You are Quinn, the Quant and the team's sanity check, not the driver. For each prop ask: is tonight's line inside his realistic range? Use averages vs line relative to sdL20 (volatility), minutes stability (minL5 vs minThisSeason), sample sizes, and whether the withoutTeammates numbers are a real sample or noise. When nbaCom tracking is present, use rebChances and potAst as the underlying volume: a rebound line below what his rebound chances support, or potential assists well above his assist average, is a real statistical edge; usagePctL5 above usagePct means a growing role. Flag props where the matchup story needs a level of production he rarely reaches.
 For EVERY candidate return: {"notes":[{"id":"c1","lean":"Over|Pass","prob":0-100 (chance the Over hits),"grade":1-10,"note":"max 20 words"}]}`,
   vig: `You are Vig, the Market analyst. Judge each Over on the DraftKings market: line and price movement from open to now (movement toward the Over means money agrees), juice, no-vig fair probability vs your read, lines that look set low or high vs his averages and matchup (possible traps), and nearby alt-ladder prices.
 For EVERY candidate return: {"notes":[{"id":"c1","lean":"Over|Pass","grade":1-10,"note":"max 20 words"}]}`,
@@ -1075,8 +1124,8 @@ Weighting: Scout 50%, Quinn 30%, Vig 20%. Rules:
 - Every pick needs a concrete matchup or usage reason (Scout grade 6 or higher). Never pick on recent trend alone.
 - Drop any player the recon says is out, doubtful or on a minutes limit.
 - Overs only. Max one pick per player. Avoid stacking picks that all need the same game script. Skip juice worse than -200 unless conviction is exceptional.
-- The headline must name the same stat and line as the pick. "why" must cite the matchup numbers (position rank, pace, with/without, scheme) and at most one trend number.
-Return: {"summary":"2 sentences on how this matchup sets up for Overs","picks":[{"id":"c1","side":"Over","conviction":1-10,"hitPct":0-100 (chance the Over hits),"agree":"3/3|2/3","keyFactor":"position|pace|usage|scheme|script","headline":"max 10 words","why":"max 45 words","risks":["short risk"]}],"fades":[{"id":"cX","note":"max 15 words on why the team passed on a tempting prop"}]}`
+- The headline must name the same stat and line as the pick. "why" must cite the matchup numbers (position rank, play-type or zone rank, pace, with/without, scheme) and at most one trend number.
+Return: {"summary":"2 sentences on how this matchup sets up for Overs","picks":[{"id":"c1","side":"Over","conviction":1-10,"hitPct":0-100 (chance the Over hits),"agree":"3/3|2/3","keyFactor":"position|playtype|zone|tracking|pace|usage|scheme|script","headline":"max 10 words","why":"max 45 words","risks":["short risk"]}],"fades":[{"id":"cX","note":"max 15 words on why the team passed on a tempting prop"}]}`
 };
 const RECON_PROMPT = (g, date) => `Use Google Search to research tonight's NBA game: ${g.away.name} at ${g.home.name} on ${date}.
 In under 180 words of plain text, cover:
@@ -1301,6 +1350,7 @@ $('datePick').onchange = e => { if(e.target.value){ S.date = e.target.value; loa
   window.addEventListener('beforeunload', ()=>lsSet('dkat-prefs', { market:S.market, sort:S.sort }));
   renderAll();
   loadSlate();
+  loadNbaCom();
   // auto-refresh lines every 5 minutes
   setInterval(()=>{ if(!document.hidden && S.games.some(g=>!g.status.completed)) $('refreshBtn').click(); }, 5*60*1000);
 })();
