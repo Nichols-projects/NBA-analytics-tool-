@@ -1,13 +1,9 @@
 name: NBA.com daily data
 
+# NBA.com blocks GitHub's cloud servers (every request timed out on 2026-11-11),
+# so this job is manual-only. The laptop script does the daily pull instead.
 on:
-  schedule:
-    - cron: "37 14 * * *"     # every morning, about 7:37 AM Arizona time
   workflow_dispatch:           # "Run workflow" button on the Actions tab
-  push:
-    paths:
-      - "scripts/fetch_nba_com.py"
-      - ".github/workflows/nba-data.yml"
 
 permissions:
   contents: write
