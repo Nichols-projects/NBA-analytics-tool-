@@ -103,7 +103,7 @@
 
   <footer class="text-center text-[11px] text-slate-600 py-6 leading-relaxed">
     Live data: ESPN public feeds (DraftKings is ESPN's odds provider). Not affiliated with DraftKings, ESPN or the NBA. Lines can move or be pulled at any time, so confirm in the DK app before betting.<br/>
-    For research and entertainment. Gambling problem? Call 1-800-GAMBLER. · <span class="font-mono">v1.3</span>
+    For research and entertainment. Gambling problem? Call 1-800-GAMBLER. · <span class="font-mono">v1.4</span>
   </footer>
 </main>
 
@@ -790,8 +790,8 @@ function renderAll(){
 const AG = {
   key: lsGet('dkat-gemini-key') || '',
   model: lsGet('dkat-gemini-model') || '',
-  nPicks: lsGet('dkat-agent-npicks') || 8,
-  models: [], showSettings: false, running: false, steps: {}, error: null, result: null, showReports: false, open: true
+  nPicks: lsGet('dkat-agent-npicks-game') || 3,
+  models: [], showSettings: false, running: false, steps: {}, error: null, results: {}, resultsDate: null, runningGame: null, showReports: false, open: true
 };
 const AGENTS = [
   { key:'quinn', name:'Quinn', role:'Quant' },
@@ -869,10 +869,11 @@ function statLine(games, f, line){
   const v = games.map(f); const n = v.length; const hits = v.filter(x=>x>line).length;
   return { n, hits, str: n ? `${hits}/${n}` : '0/0', rate: n ? hits/n : null };
 }
-function buildCandidates(maxN=40){
+function buildCandidates(gameId, maxN=25){
   const out = [];
   const outOn = tid => Object.values(S.players).filter(x=>x.teamId===tid && x.injury && /out/i.test(x.injury)).map(x=>x.name).slice(0,5);
   for(const [id,P] of Object.entries(S.props)){
+    if(gameId && P.gameId!==gameId) continue;
     const p = S.players[id]; if(!p) continue;
     if(p.injury && /out/i.test(p.injury)) continue;
     const g = S.games.find(x=>x.id===P.gameId); if(!g || (g.status.state && g.status.state!=='pre')) continue;
@@ -884,9 +885,9 @@ function buildCandidates(maxN=40){
       const l5=statLine(G.slice(0,5),mk.f,m.line), l10=statLine(G.slice(0,10),mk.f,m.line), l20=statLine(G.slice(0,20),mk.f,m.line);
       const sz=statLine(cur,mk.f,m.line), ls=statLine(prev,mk.f,m.line), hh=statLine(h2h,mk.f,m.line);
       const blend = 0.35*l10.rate + 0.2*l20.rate + 0.25*(sz.n>=4?sz.rate:l20.rate) + 0.2*(ls.n>=10?ls.rate:l20.rate);
-      const side = blend>=0.5 ? 'Over' : 'Under', conf = side==='Over' ? blend : 1-blend;
-      const price = side==='Over' ? m.over : m.under;
-      if(isNaN(price) || price < -250) continue;
+      const conf = blend;                                    // Overs only: rank by how often he clears the line
+      const price = m.over;
+      if(isNaN(price) || price < -250 || l10.rate < 0.3) continue;
       const v20 = G.slice(0,20).map(mk.f), a20 = avg(v20);
       const sd = Math.sqrt(avg(v20.map(x=>(x-a20)**2)));
       const fo = fairOver(m);
@@ -895,7 +896,7 @@ function buildCandidates(maxN=40){
       out.push({ conf, c: {
         id:'', pid:id, mkey:mk.key, player:p.name, pos:p.pos, team:p.team, opp:p.opp, venue:p.home?'home':'away',
         tip: fmtTime(g.date), spread:g.spread||null, gameTotal:g.total||null,
-        market:mk.label, line:m.line, statLean:side, overOdds:m.over, underOdds:m.under,
+        market:mk.label, line:m.line, side:'Over', overOdds:m.over, underOdds:m.under,
         openLine:m.openLine ?? m.line, openOver:isNaN(m.openOver)?null:m.openOver, openUnder:isNaN(m.openUnder)?null:m.openUnder,
         noVigOverPct: fo==null?null:Math.round(fo*100),
         overHits:{ L5:l5.str, L10:l10.str, L20:l20.str, thisSeason:sz.str, lastSeason:ls.str, vsOpp:hh.str },
@@ -917,32 +918,36 @@ function buildCandidates(maxN=40){
 }
 
 const AGENT_BASE = `You are part of "Agent Endzone: Hardwood", a private NBA player-prop research team working for one bettor who bets only at DraftKings.
-All data below is real, pulled tonight from ESPN and DraftKings. Hit counts like "7/10" mean how many of those games the player went OVER tonight's line (the same line applied to past games). restDays 0 = back-to-back. oppDefRankVsMarket: 1 = opponent allows the fewest of this stat (toughest), 30 = allows the most (softest). Early-season defense ranks use few games; weigh them lightly when oppGamesPlayed is small.
+The bettor only plays OVERS. Every candidate is an Over bet; judge only whether the Over hits, never recommend an Under.
+All data below is real, pulled tonight from ESPN and DraftKings for ONE game. Hit counts like "7/10" mean how many of those games the player went OVER tonight's line (the same line applied to past games). restDays 0 = back-to-back. oppDefRankVsMarket: 1 = opponent allows the fewest of this stat (toughest), 30 = allows the most (softest). Early-season defense ranks use few games; weigh them lightly when oppGamesPlayed is small.
 Use only the data provided. Do not invent injuries, news, or stats. Be concise and specific. Respond with JSON only.`;
 
 const AGENT_PROMPTS = {
   quinn: `You are Quinn, the Quant. Judge each prop purely on the numbers: hit rates across windows, sample size, recent form vs longer baseline, the gap between averages and the line relative to sdL20 (volatility), and minutes stability.
-For EVERY candidate return: {"notes":[{"id":"c1","lean":"Over|Under|Pass","prob":0-100 (your estimate that your lean hits),"grade":1-10 (statistical strength of the lean),"note":"max 20 words"}]}`,
+For EVERY candidate return: {"notes":[{"id":"c1","lean":"Over|Pass","prob":0-100 (your estimate that the Over hits),"grade":1-10 (statistical strength of the lean),"note":"max 20 words"}]}`,
   scout: `You are Scout, the Matchup analyst. Judge each prop on context: opponent defense rank vs this stat, history vs this opponent, rest/back-to-back, injuries (teammates out usually raise usage and shot volume; opponents' missing players can soften the matchup), home/away, and blowout risk from the spread and game total (big spreads can cut starters' minutes).
-For EVERY candidate return: {"notes":[{"id":"c1","lean":"Over|Under|Pass","grade":1-10 (how strongly the matchup supports your lean),"note":"max 20 words"}]}`,
+For EVERY candidate return: {"notes":[{"id":"c1","lean":"Over|Pass","grade":1-10 (how strongly the matchup supports the Over),"note":"max 20 words"}]}`,
   vig: `You are Vig, the Market analyst. Judge each prop on the DraftKings market: line and price movement from open to now (movement toward a side means money agrees with it), the juice on each side, the no-vig fair probability vs the hit rates, lines that look suspiciously low or high vs the averages (possible traps), and nearby alt-ladder prices.
-For EVERY candidate return: {"notes":[{"id":"c1","lean":"Over|Under|Pass","grade":1-10 (how strongly the market supports your lean),"note":"max 20 words"}]}`,
-  chief: n => `You are Chief, Mission Control. You get tonight's candidate props plus independent reports from Quinn (Quant), Scout (Matchup) and Vig (Market).
-Pick the ${n} props MOST LIKELY TO HIT, ranked by conviction (probability of hitting), NOT by price value. The bettor makes the final call, so be candid about risk.
-Rules: prefer picks where at least 2 of the 3 agents lean the same side; max one pick per player; avoid stacking several picks that depend on the same game script; skip anything with juice worse than -200 unless conviction is exceptional.
-Return: {"summary":"2 sentences on tonight's slate","picks":[{"id":"c1","side":"Over|Under","conviction":1-10,"hitPct":0-100,"agree":"3/3|2/3","headline":"max 10 words","why":"max 40 words, cite the specific numbers","risks":["short risk", "..."]}],"fades":[{"id":"cX","note":"max 15 words on why the team passed on a tempting prop"}]}`
+For EVERY candidate return: {"notes":[{"id":"c1","lean":"Over|Pass","grade":1-10 (how strongly the market supports the Over),"note":"max 20 words"}]}`,
+  chief: n => `You are Chief, Mission Control. You get one game's candidate OVER props plus independent reports from Quinn (Quant), Scout (Matchup) and Vig (Market).
+Pick the ${n} OVERS in this game MOST LIKELY TO HIT (fewer if fewer are worth it), ranked by conviction (probability of hitting), NOT by price value. The bettor makes the final call, so be candid about risk.
+Rules: Overs only, never an Under; prefer picks where at least 2 of the 3 agents lean Over; the headline must name the same stat and line as the pick; max one pick per player; avoid stacking several picks that depend on the same game script; skip anything with juice worse than -200 unless conviction is exceptional.
+Return: {"summary":"2 sentences on how this game sets up for Overs","picks":[{"id":"c1","side":"Over","conviction":1-10,"hitPct":0-100 (chance the Over hits),"agree":"3/3|2/3","headline":"max 10 words","why":"max 40 words, cite the specific numbers","risks":["short risk", "..."]}],"fades":[{"id":"cX","note":"max 15 words on why the team passed on a tempting prop"}]}`
 };
 
 async function runAgents(){
   if(AG.running) return;
+  const gameId = S.gameFilter, game = S.games.find(g=>g.id===gameId);
+  if(!game){ AG.error = 'Pick a game first, either with the game buttons at the top or the game menu here.'; renderAgents(true); return; }
   if(!AG.key){ AG.showSettings = true; AG.error = 'Add your free Gemini API key first.'; renderAgents(true); return; }
-  AG.running = true; AG.error = null; AG.result = null; AG.usedModel = null; AG.badModels = new Set(); AG.steps = { prep:'run' }; renderAgents(true);
+  AG.running = true; AG.runningGame = gameId; AG.lastGame = gameId; AG.error = null; delete AG.results[gameId]; AG.usedModel = null; AG.badModels = new Set(); AG.steps = { prep:'run' }; renderAgents(true);
   try{
     if(!AG.model){ try { AG.models = await gemList(); } catch(e){} AG.model = pickDefaultModel(AG.models); }
     await Promise.all(Object.keys(S.props).map(id=>loadLog(id)));
     if(!S.defense) await new Promise(res=>{ const t=setInterval(()=>{ if(S.defense){ clearInterval(t); res(); } }, 500); setTimeout(()=>{ clearInterval(t); res(); }, 20000); });
-    const cands = buildCandidates(30);
-    if(cands.length < 3) throw new Error('Not enough props with DraftKings lines for games that have not started yet. Try earlier in the day.');
+    if(game.status.state && game.status.state!=='pre') throw new Error(`${game.short} has already started. DraftKings pulls pregame props at tip-off.`);
+    const cands = buildCandidates(gameId, 25);
+    if(cands.length < 2) throw new Error(`Not enough Over props with DraftKings lines for ${game.short} yet. DK usually posts them the day of the game.`);
     AG.steps = { prep:'done' }; renderAgents(true);
     const data = JSON.stringify(cands.map(({pid,mkey,...c})=>c));
     const NAMES = { quinn:'Quinn', scout:'Scout', vig:'Vig' };
@@ -950,7 +955,7 @@ async function runAgents(){
     for(const [i,k] of ['quinn','scout','vig'].entries()){       // one at a time, so Gemini isn't hit all at once
       if(i) await new Promise(res=>setTimeout(res, 1500));
       AG.steps[k] = 'run'; renderAgents(true);
-      try { reports[k] = await gemJSON(AGENT_BASE+'\n\n'+AGENT_PROMPTS[k], `Tonight's candidates (${cands.length}):\n${data}`, NAMES[k]); AG.steps[k]='done'; }
+      try { reports[k] = await gemJSON(AGENT_BASE+'\n\n'+AGENT_PROMPTS[k], `${game.short} Over candidates (${cands.length}):\n${data}`, NAMES[k]); AG.steps[k]='done'; }
       catch(e){ AG.steps[k]='fail'; renderAgents(true); throw e; }
       renderAgents(true);
     }
@@ -963,21 +968,24 @@ async function runAgents(){
     const byId = Object.fromEntries(cands.map(c=>[c.id,c]));
     const noteMap = r => Object.fromEntries((r?.notes||[]).map(n=>[n.id,n]));
     const Q = noteMap(quinn), Sc = noteMap(scout), V = noteMap(vig);
-    const picks = (chief?.picks||[]).filter(p=>byId[p.id]).map(p=>({ ...p, cand: byId[p.id], q:Q[p.id], s:Sc[p.id], v:V[p.id] }))
+    const seen = new Set();
+    const picks = (chief?.picks||[]).filter(p=>byId[p.id] && !/under/i.test(p.side||'') && !seen.has(byId[p.id].pid) && seen.add(byId[p.id].pid)).map(p=>({ ...p, side:'Over', cand: byId[p.id], q:Q[p.id], s:Sc[p.id], v:V[p.id] }))
       .sort((a,b)=>(b.conviction||0)-(a.conviction||0) || (b.hitPct||0)-(a.hitPct||0));
     const fades = (chief?.fades||[]).filter(f=>byId[f.id]).map(f=>({ ...f, cand: byId[f.id] }));
-    if(!picks.length) throw new Error('Chief returned no usable picks. Run again.');
-    AG.result = { at: Date.now(), date: S.date, model: AG.usedModel || AG.model, summary: chief.summary||'', picks, fades, nCands: cands.length };
-    lsSet('dkat-agents-'+S.date, AG.result);
+    if(!picks.length) throw new Error('Chief found no Overs worth taking in this game. Try another game or run again.');
+    AG.results[gameId] = { at: Date.now(), date: S.date, gameId, game: game.short, model: AG.usedModel || AG.model, summary: chief.summary||'', picks: picks.slice(0, AG.nPicks), fades, nCands: cands.length };
+    lsSet('dkat-agents2-'+S.date, AG.results);
   }catch(e){ AG.error = e.message || String(e); }
-  AG.running = false; renderAgents(true);
+  AG.running = false; AG.runningGame = null; renderAgents(true);
 }
 
 function renderAgents(force){
   const el = $('agentPanel'); if(!el) return;
   const ae = document.activeElement;
   if(!force && ae && el.contains(ae) && (ae.tagName==='INPUT' || ae.tagName==='SELECT')) return;
-  if(!AG.result || AG.result.date!==S.date){ const c = lsGet('dkat-agents-'+S.date); AG.result = c && c.picks ? c : (AG.result?.date===S.date ? AG.result : null); }
+  if(AG.resultsDate!==S.date){ AG.results = lsGet('dkat-agents2-'+S.date) || {}; AG.resultsDate = S.date; }
+  const gSel = S.games.find(g=>g.id===S.gameFilter);
+  const R = gSel ? AG.results[gSel.id] : null;
   const stepPill = k => { const st = AG.steps[k]; const a = AGENTS.find(x=>x.key===k);
     const cls = st==='done' ? 'pill-hit' : st==='fail' ? 'pill-miss' : st==='run' ? 'pill-neut' : 'pill-dim';
     return `<span class="pill ${cls}">${st==='run'?'<span class="spin mr-1.5" style="width:10px;height:10px"></span>':st==='done'?'✓ ':''}${a.name} · ${a.role}</span>`; };
@@ -992,15 +1000,14 @@ function renderAgents(force){
             <option value="">Auto (best Flash model)</option>
             ${[...new Set([...(AG.models||[]), AG.model].filter(Boolean))].map(m=>`<option value="${esc(m)}" ${m===AG.model?'selected':''}>${esc(m)}</option>`).join('')}
           </select></label>
-        <label class="text-xs text-slate-400">Picks
+        <label class="text-xs text-slate-400">Picks per game
           <select id="agentN" class="mt-1 block bg-slate-900 border border-slate-700 rounded-md px-2 py-2 text-sm">
-            ${[5,8,10,12].map(n=>`<option ${n==AG.nPicks?'selected':''}>${n}</option>`).join('')}
+            ${[3,5,8].map(n=>`<option ${n==AG.nPicks?'selected':''}>${n}</option>`).join('')}
           </select></label>
         <button id="agentLoadModels" class="text-xs border border-slate-700 hover:border-neon/60 rounded-md px-3 py-2">Load model list</button>
         <button id="agentSave" class="text-xs font-bold bg-neon text-slate-950 rounded-md px-4 py-2">Save</button>
       </div>
     </div>`;
-  const R = AG.result;
   const gradeChip = (lab, n) => n ? `<span class="text-[10px] font-mono px-1.5 py-0.5 rounded ${n.lean && n.lean!=='Pass'?'bg-slate-800 text-slate-300':'bg-slate-900 text-slate-500'}" title="${esc(n.note||'')}">${lab} ${n.grade??'–'}${n.lean&&n.lean!=='Pass'?' '+n.lean[0]:''}</span>` : '';
   const pickCard = (p, i) => {
     const c = p.cand, price = p.side==='Over' ? c.overOdds : c.underOdds;
@@ -1010,7 +1017,7 @@ function renderAgents(force){
       <div class="flex items-start justify-between gap-2">
         <div class="min-w-0"><div class="text-[11px] font-mono text-slate-500">#${i+1} · ${esc(c.team)} ${c.venue==='home'?'vs':'@'} ${esc(c.opp)} · ${esc(c.tip)}</div>
           <div class="font-extrabold text-base leading-tight truncate">${esc(c.player)}</div></div>
-        <div class="text-right shrink-0"><div class="text-2xl font-extrabold font-mono leading-none" style="color:${col}">${conv}<span class="text-xs text-slate-500">/10</span></div><div class="text-[10px] text-slate-500 font-mono">${p.hitPct!=null?p.hitPct+'% hit':''}</div></div>
+        <div class="text-right shrink-0"><div class="text-2xl font-extrabold font-mono leading-none" style="color:${col}">${conv}<span class="text-xs text-slate-500">/10</span></div><div class="text-[10px] text-slate-500 font-mono">${p.hitPct!=null?p.hitPct+'% to hit':''}</div></div>
       </div>
       <div class="flex items-center gap-2 flex-wrap"><span class="pill ${p.side==='Over'?'pill-hit':'pill-miss'}">${esc(p.side)} ${c.line} ${esc(c.market)}</span><span class="font-mono text-sm">${fmtOdds(price)}</span><span class="text-[10px] text-slate-500 font-mono">${esc(p.agree||'')} agree</span></div>
       ${p.headline?`<div class="text-sm font-semibold text-slate-200">${esc(p.headline)}</div>`:''}
@@ -1023,44 +1030,51 @@ function renderAgents(force){
       ${R.picks.map(p=>`<tr class="border-b border-slate-800/60 align-top"><td class="py-2 pr-2 font-semibold whitespace-nowrap">${esc(p.cand.player.split(' ').slice(-1)[0])} ${esc(p.side[0])} ${p.cand.line} ${esc(p.cand.market)}</td>${[p.q,p.s,p.v].map(n=>`<td class="py-2 pr-2 text-slate-400 min-w-[160px]">${n?`<b class="text-slate-300">${esc(n.lean||'')} ${n.grade??''}/10${n.prob!=null?' · '+n.prob+'%':''}</b> ${esc(n.note||'')}`:'—'}</td>`).join('')}</tr>`).join('')}
     </tbody></table>
     ${R.fades?.length?`<div class="mt-3 text-xs text-slate-400"><span class="font-semibold text-slate-300">Passed on:</span> ${R.fades.map(f=>`${esc(f.cand.player)} ${esc(f.cand.market)} ${f.cand.line} (${esc(f.note||'')})`).join(' · ')}</div>`:''}</div>` : '';
-  const hasSlate = S.games.some(g=>!g.status.state || g.status.state==='pre') && Object.keys(S.props).length;
+  const pre = g => !g.status.state || g.status.state==='pre';
+  const canRun = gSel && pre(gSel) && !AG.running;
+  const runLabel = AG.running ? `Agents on ${esc(S.games.find(g=>g.id===AG.runningGame)?.short||'')}…` : !gSel ? 'Pick a game' : !pre(gSel) ? 'Game started' : R ? 'Run again' : `Run ${esc(gSel.short)}`;
+  const gameMenu = `<select id="agentGame" class="bg-slate-900 border border-slate-700 rounded-md text-xs px-2 py-2 outline-none max-w-[190px]"><option value="all">Choose a game…</option>${S.games.map(g=>`<option value="${g.id}" ${g.id===S.gameFilter?'selected':''}>${esc(g.short)} · ${pre(g)?fmtTime(g.date):'started'}${AG.results[g.id]?' ✓':''}</option>`).join('')}</select>`;
   el.innerHTML = `
     <div class="flex flex-wrap items-center gap-3">
       <div class="flex items-center gap-3 min-w-0">
         <div class="w-9 h-9 rounded-lg bg-neon/15 border border-neon/40 grid place-items-center text-neon font-mono font-bold text-xs shrink-0">AI</div>
         <div class="min-w-0"><h3 class="font-extrabold tracking-tight">Agent Picks</h3>
-          <div class="text-[11px] text-slate-500 font-mono truncate">${R?`Ran ${new Date(R.at).toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'})} · ${R.nCands} props screened · ${esc(R.model)}`:'Quinn, Scout and Vig scout tonight’s board, Chief ranks the picks most likely to hit'}</div></div>
+          <div class="text-[11px] text-slate-500 font-mono truncate">${R?`Ran ${new Date(R.at).toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'})} · ${esc(R.game)} · ${R.nCands} Overs screened · ${esc(R.model)}`:'Overs only, one game at a time: pick a game, then run the team'}</div></div>
       </div>
-      <div class="ml-auto flex items-center gap-2">
+      <div class="ml-auto flex flex-wrap items-center gap-2">
         ${R?`<button id="agentCopy" class="text-xs border border-slate-700 hover:border-neon/60 rounded-md px-3 py-2">Copy picks</button>`:''}
         <button id="agentGear" class="text-xs border border-slate-700 hover:border-neon/60 rounded-md px-3 py-2">Settings</button>
-        <button id="agentRun" ${AG.running||!hasSlate?'disabled':''} class="text-sm font-bold rounded-md px-4 py-2 ${AG.running||!hasSlate?'bg-slate-800 text-slate-500':'bg-neon text-slate-950 hover:brightness-110'}">${AG.running?'Agents working…':R?'Run again':'Run agent team'}</button>
+        ${gameMenu}
+        <button id="agentRun" ${canRun?'':'disabled'} class="text-sm font-bold rounded-md px-4 py-2 whitespace-nowrap ${canRun?'bg-neon text-slate-950 hover:brightness-110':'bg-slate-800 text-slate-500'}">${runLabel}</button>
       </div>
     </div>
-    ${AG.running || Object.keys(AG.steps).length && !R ? `<div class="flex flex-wrap gap-2 mt-4">${['quinn','scout','vig','chief'].map(stepPill).join('')}</div>` : ''}
+    ${AG.running || (Object.keys(AG.steps).length && !R && AG.lastGame===S.gameFilter) ? `<div class="flex flex-wrap gap-2 mt-4">${['quinn','scout','vig','chief'].map(stepPill).join('')}</div>` : ''}
     ${AG.running && AG.status?`<div class="mt-3 text-xs font-mono text-slate-400">${esc(AG.status)}</div>`:''}
     ${AG.error?`<div class="mt-3 text-sm text-red-400">${esc(AG.error)}</div>`:''}
-    ${!hasSlate && !R && !S.loadingSlate ? `<div class="mt-3 text-xs text-slate-500">No upcoming games with DraftKings props right now. The agents run on games that haven't tipped off yet.</div>`:''}
+    ${!gSel && !AG.running && Object.keys(AG.results).length ? `<div class="mt-3 flex flex-wrap gap-2 text-xs"><span class="text-slate-500 self-center">Already run today:</span>${Object.values(AG.results).map(r=>`<button data-rg="${r.gameId}" class="pill pill-hit">${esc(r.game)} · ${r.picks.length}</button>`).join('')}</div>` : ''}
+    ${gSel && !pre(gSel) && !R ? `<div class="mt-3 text-xs text-slate-500">${esc(gSel.short)} has started. The agents only run on games that haven't tipped off.</div>`:''}
     ${AG.showSettings || !AG.key ? settings : ''}
     ${R?`${R.summary?`<p class="mt-4 text-sm text-slate-300">${esc(R.summary)}</p>`:''}
-      <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3 mt-4">${R.picks.map(pickCard).join('')}</div>
-      <div class="mt-3 flex flex-wrap items-center gap-3 text-[11px] text-slate-500"><button id="agentReports" class="underline hover:text-slate-300">${AG.showReports?'Hide':'Show'} full agent reports</button><span>Conviction = the team's confidence the pick hits, not a guarantee. Tap a pick to open its breakdown. You make the final call.</span></div>
+      <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3 mt-4">${R.picks.map(pickCard).join('')}</div>
+      <div class="mt-3 flex flex-wrap items-center gap-3 text-[11px] text-slate-500"><button id="agentReports" class="underline hover:text-slate-300">${AG.showReports?'Hide':'Show'} full agent reports</button><span>Conviction = the team's confidence the Over hits, not a guarantee. Tap a pick to open its breakdown. You make the final call.</span></div>
       ${AG.showReports?reports:''}`:''}
   `;
   // wire
   const on = (id, f) => { const b = $(id); if(b) b.onclick = f; };
   on('agentRun', runAgents);
+  const gm = $('agentGame'); if(gm) gm.onchange = () => { S.gameFilter = gm.value; AG.error = null; renderAll(); };
+  el.querySelectorAll('[data-rg]').forEach(b=>b.onclick=()=>{ S.gameFilter = b.dataset.rg; renderAll(); });
   on('agentGear', ()=>{ AG.showSettings = !AG.showSettings; renderAgents(true); });
   on('agentReports', ()=>{ AG.showReports = !AG.showReports; renderAgents(true); });
-  on('agentSave', ()=>{ AG.key = $('agentKey').value.trim(); AG.model = $('agentModel').value; AG.nPicks = +$('agentN').value || 8;
-    lsSet('dkat-gemini-key', AG.key); lsSet('dkat-gemini-model', AG.model); lsSet('dkat-agent-npicks', AG.nPicks);
+  on('agentSave', ()=>{ AG.key = $('agentKey').value.trim(); AG.model = $('agentModel').value; AG.nPicks = +$('agentN').value || 3;
+    lsSet('dkat-gemini-key', AG.key); lsSet('dkat-gemini-model', AG.model); lsSet('dkat-agent-npicks-game', AG.nPicks);
     AG.showSettings = false; AG.error = null; renderAgents(true); });
   on('agentLoadModels', async ()=>{ const k = $('agentKey').value.trim(); if(!k){ AG.error='Paste your Gemini key first.'; renderAgents(true); return; }
     AG.key = k; try { AG.models = await gemList(); AG.error = null; if(!AG.model) AG.model = pickDefaultModel(AG.models); } catch(e){ AG.error = e.message; } AG.showSettings = true; renderAgents(true); });
   on('agentCopy', async ()=>{
-    const txt = `Agent Picks ${R.date}\n` + R.picks.map((p,i)=>`${i+1}. ${p.cand.player} ${p.side} ${p.cand.line} ${p.cand.market} (${fmtOdds(p.side==='Over'?p.cand.overOdds:p.cand.underOdds)}) · conviction ${p.conviction}/10 · ${p.why||''}`).join('\n');
+    const txt = `Agent Picks ${R.game} ${R.date}\n` + R.picks.map((p,i)=>`${i+1}. ${p.cand.player} Over ${p.cand.line} ${p.cand.market} (${fmtOdds(p.cand.overOdds)}) · conviction ${p.conviction}/10 · ${p.why||''}`).join('\n');
     try { await navigator.clipboard.writeText(txt); $('agentCopy').textContent='Copied'; } catch(e){ $('agentCopy').textContent='Copy failed'; } });
-  el.querySelectorAll('[data-pick]').forEach(b=>b.onclick=()=>{ const p = R.picks[+b.dataset.pick]; S.market = p.cand.mkey; S.gameFilter='all'; selectPlayer(p.cand.pid); $('detail').scrollIntoView({behavior:'smooth', block:'start'}); });
+  el.querySelectorAll('[data-pick]').forEach(b=>b.onclick=()=>{ const p = R.picks[+b.dataset.pick]; S.market = p.cand.mkey; selectPlayer(p.cand.pid); $('detail').scrollIntoView({behavior:'smooth', block:'start'}); });
 }
 
 // ===== SEARCH =====
