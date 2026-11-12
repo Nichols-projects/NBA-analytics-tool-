@@ -67,6 +67,7 @@
 <main class="max-w-[1500px] mx-auto px-4 py-5">
   <div id="notice" class="hidden card p-4 mb-5 text-sm"></div>
   <section id="agentPanel" class="card p-4 sm:p-5 mb-5 glow"></section>
+  <section id="matchupBoard" class="card p-4 sm:p-5 mb-5"></section>
   <div class="grid grid-cols-1 xl:grid-cols-12 gap-5">
 
     <!-- PROP BOARD -->
@@ -103,7 +104,7 @@
 
   <footer class="text-center text-[11px] text-slate-600 py-6 leading-relaxed">
     Live data: ESPN public feeds (DraftKings is ESPN's odds provider). Not affiliated with DraftKings, ESPN or the NBA. Lines can move or be pulled at any time, so confirm in the DK app before betting.<br/>
-    For research and entertainment. Gambling problem? Call 1-800-GAMBLER. · <span class="font-mono">v1.6</span>
+    For research and entertainment. Gambling problem? Call 1-800-GAMBLER. · <span class="font-mono">v1.7</span>
   </footer>
 </main>
 
@@ -947,7 +948,7 @@ function renderAll(){
   // keep focus on inputs inside detail from being destroyed mid-typing
   const ae = document.activeElement?.id;
   if(ae==='customLine' || ae==='calcOdds'){ renderBoard(); return; }
-  renderGames(); renderTabs(); renderBoard(); renderDetail(); renderAgents();
+  renderGames(); renderTabs(); renderBoard(); renderDetail(); renderAgents(); renderMatchupBoard();
 }
 
 // ===== AGENT TEAM (Gemini) =====
@@ -956,7 +957,7 @@ const AG = {
   key: lsGet('dkat-gemini-key') || '',
   model: lsGet('dkat-gemini-model') || '',
   nPicks: lsGet('dkat-agent-npicks-game') || 3,
-  models: [], showSettings: false, running: false, steps: {}, error: null, results: {}, resultsDate: null, runningGame: null, showReports: false, open: true
+  models: [], showSettings: false, running: false, steps: {}, error: null, results: {}, resultsDate: null, published: {}, publishedAt: null, publishedDate: null, runningGame: null, showReports: false, open: true
 };
 const AGENTS = [
   { key:'recon', name:'Scout', role:'Live recon' },
@@ -1135,6 +1136,17 @@ In under 180 words of plain text, cover:
 4) Pace and style notes.
 Only state what the search results support. Write "not found" for anything you cannot confirm. No betting advice.`;
 
+// Picks the GitHub job publishes each day (picks.json), shown to every visitor without a Gemini key
+async function loadPublishedPicks(){
+  for(const u of ['https://raw.githubusercontent.com/Nichols-projects/NBA-analytics-tool-/main/picks.json', 'picks.json']){
+    try {
+      const r = await fetch(u + '?m=' + Math.floor(Date.now()/300000)); if(!r.ok) continue;
+      const j = await r.json(); if(!j || !j.games) continue;
+      AG.published = j.date===S.date ? j.games : {}; AG.publishedAt = j.updated; AG.publishedDate = j.date; scheduleRender(); return;
+    } catch(e){}
+  }
+}
+
 async function runAgents(){
   if(AG.running) return;
   const gameId = S.gameFilter, game = S.games.find(g=>g.id===gameId);
@@ -1194,7 +1206,10 @@ function renderAgents(force){
   if(!force && ae && el.contains(ae) && (ae.tagName==='INPUT' || ae.tagName==='SELECT')) return;
   if(AG.resultsDate!==S.date){ AG.results = lsGet('dkat-agents2-'+S.date) || {}; AG.resultsDate = S.date; }
   const gSel = S.games.find(g=>g.id===S.gameFilter);
-  const R = gSel ? AG.results[gSel.id] : null;
+  const resultFor = gid => AG.results[gid] || AG.published?.[gid] || null;
+  const isPub = r => !!r && !AG.results[r.gameId] && !!AG.published?.[r.gameId];
+  const R = gSel ? resultFor(gSel.id) : null;
+  const allRes = S.games.map(g=>resultFor(g.id)).filter(Boolean);
   const stepPill = k => { const st = AG.steps[k]; const a = AGENTS.find(x=>x.key===k);
     const cls = st==='done' ? 'pill-hit' : st==='fail' ? 'pill-miss' : st==='run' ? 'pill-neut' : 'pill-dim';
     return `<span class="pill ${cls}">${st==='run'?'<span class="spin mr-1.5" style="width:10px;height:10px"></span>':st==='done'?'✓ ':''}${a.name} · ${a.role}</span>`; };
@@ -1228,11 +1243,11 @@ function renderAgents(force){
     return out.length ? `<div class="flex gap-1.5 flex-wrap">${out.join('')}</div>` : '';
   };
   const gradeChip = (lab, n) => n ? `<span class="text-[10px] font-mono px-1.5 py-0.5 rounded ${n.lean && n.lean!=='Pass'?'bg-slate-800 text-slate-300':'bg-slate-900 text-slate-500'}" title="${esc(n.note||'')}">${lab} ${n.grade??'–'}${n.lean&&n.lean!=='Pass'?' '+n.lean[0]:''}</span>` : '';
-  const pickCard = (p, i) => {
+  const pickCard = (p, i, gid) => {
     const c = p.cand, price = p.side==='Over' ? c.overOdds : c.underOdds;
     const conv = Math.max(0, Math.min(10, +p.conviction||0));
     const col = conv>=8 ? '#39ff88' : conv>=6 ? '#facc15' : '#f87171';
-    return `<button data-pick="${i}" class="text-left rounded-xl border border-slate-700 hover:border-neon/60 bg-slate-900/60 p-4 flex flex-col gap-2 transition min-w-0">
+    return `<button data-pick="${gid}:${i}" class="text-left rounded-xl border border-slate-700 hover:border-neon/60 bg-slate-900/60 p-4 flex flex-col gap-2 transition min-w-0">
       <div class="flex items-start justify-between gap-2">
         <div class="min-w-0"><div class="text-[11px] font-mono text-slate-500">#${i+1} · ${esc(c.team)} ${c.venue==='home'?'vs':'@'} ${esc(c.opp)} · ${esc(c.tip)}</div>
           <div class="font-extrabold text-base leading-tight truncate">${esc(c.player)}</div></div>
@@ -1259,7 +1274,7 @@ function renderAgents(force){
       <div class="flex items-center gap-3 min-w-0">
         <div class="w-9 h-9 rounded-lg bg-neon/15 border border-neon/40 grid place-items-center text-neon font-mono font-bold text-xs shrink-0">AI</div>
         <div class="min-w-0"><h3 class="font-extrabold tracking-tight">Agent Picks</h3>
-          <div class="text-[11px] text-slate-500 font-mono truncate">${R?`Ran ${new Date(R.at).toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'})} · ${esc(R.game)} · ${R.nCands} Overs screened · ${esc(R.model)}`:'Overs only, matchup first: pick a game, then run the team'}</div></div>
+          <div class="text-[11px] text-slate-500 font-mono truncate">${R?`${isPub(R)?'Published':'Ran'} ${new Date(R.at).toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'})} · ${esc(R.game)} · ${R.nCands} Overs screened · ${esc(R.model)}${isPub(R)?' · published by the agent team':''}`:(allRes.length?`Today's team picks for ${allRes.length} game${allRes.length>1?'s':''}${AG.publishedAt?` · updated ${new Date(AG.publishedAt).toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'})}`:''}`:'Overs only, matchup first: pick a game, then run the team')}</div></div>
       </div>
       <div class="ml-auto flex flex-wrap items-center gap-2">
         ${R?`<button id="agentCopy" class="text-xs border border-slate-700 hover:border-neon/60 rounded-md px-3 py-2">Copy picks</button>`:''}
@@ -1271,17 +1286,22 @@ function renderAgents(force){
     ${AG.running || (Object.keys(AG.steps).length && !R && AG.lastGame===S.gameFilter) ? `<div class="flex flex-wrap gap-2 mt-4">${['recon','scout','quinn','vig','chief'].map(stepPill).join('')}</div>` : ''}
     ${AG.running && AG.status?`<div class="mt-3 text-xs font-mono text-slate-400">${esc(AG.status)}</div>`:''}
     ${AG.error?`<div class="mt-3 text-sm text-red-400">${esc(AG.error)}</div>`:''}
-    ${!gSel && !AG.running && Object.keys(AG.results).length ? `<div class="mt-3 flex flex-wrap gap-2 text-xs"><span class="text-slate-500 self-center">Already run today:</span>${Object.values(AG.results).map(r=>`<button data-rg="${r.gameId}" class="pill pill-hit">${esc(r.game)} · ${r.picks.length}</button>`).join('')}</div>` : ''}
+    ${!gSel && !AG.running && !allRes.length ? `<div class="mt-3 text-xs text-slate-500">No team picks published for today yet. They post each morning and again mid-afternoon once DraftKings has lines up. ${AG.key?'You can also pick a game and run the team yourself.':''}</div>` : ''}
     ${gSel && !pre(gSel) && !R ? `<div class="mt-3 text-xs text-slate-500">${esc(gSel.short)} has started. The agents only run on games that haven't tipped off.</div>`:''}
-    ${AG.showSettings || !AG.key ? settings : ''}
+    ${AG.showSettings ? settings : ''}
     ${R?`${R.summary?`<p class="mt-4 text-sm text-slate-300">${esc(R.summary)}</p>`:''}
-      <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3 mt-4">${R.picks.map(pickCard).join('')}</div>
+      <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3 mt-4">${R.picks.map((p,i)=>pickCard(p,i,R.gameId)).join('')}</div>
       <div class="mt-3 flex flex-wrap items-center gap-3 text-[11px] text-slate-500"><button id="agentReports" class="underline hover:text-slate-300">${AG.showReports?'Hide':'Show'} full agent reports</button><span>Conviction = the team's confidence the Over hits, not a guarantee. Tap a pick to open its breakdown. You make the final call.</span></div>
       ${AG.showReports?reports:''}`:''}
+    ${!gSel && allRes.length ? allRes.map(r=>`<div class="mt-5">
+        <div class="flex items-center gap-2 flex-wrap"><button data-rg="${r.gameId}" class="font-extrabold hover:text-neon">${esc(r.game)}</button><span class="text-[11px] font-mono text-slate-500">${esc(S.games.find(g=>g.id===r.gameId)?fmtTime(S.games.find(g=>g.id===r.gameId).date):'')} · ${r.picks.length} pick${r.picks.length>1?'s':''}</span></div>
+        ${r.summary?`<p class="mt-1 text-xs text-slate-400">${esc(r.summary)}</p>`:''}
+        <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3 mt-2">${r.picks.map((p,i)=>pickCard(p,i,r.gameId)).join('')}</div></div>`).join('')
+      + `<div class="mt-3 text-[11px] text-slate-500">Conviction = the team's confidence the Over hits, not a guarantee. Tap a game name for its full agent reports, or a pick for the player breakdown.</div>` : ''}
   `;
   // wire
   const on = (id, f) => { const b = $(id); if(b) b.onclick = f; };
-  on('agentRun', runAgents);
+  on('agentRun', ()=>{ if(!AG.key){ AG.showSettings = true; AG.error = 'Add your free Gemini API key to run the team yourself.'; renderAgents(true); return; } runAgents(); });
   const gm = $('agentGame'); if(gm) gm.onchange = () => { S.gameFilter = gm.value; AG.error = null; renderAll(); };
   el.querySelectorAll('[data-rg]').forEach(b=>b.onclick=()=>{ S.gameFilter = b.dataset.rg; renderAll(); });
   on('agentGear', ()=>{ AG.showSettings = !AG.showSettings; renderAgents(true); });
@@ -1294,7 +1314,70 @@ function renderAgents(force){
   on('agentCopy', async ()=>{
     const txt = `Agent Picks ${R.game} ${R.date}\n` + R.picks.map((p,i)=>`${i+1}. ${p.cand.player} Over ${p.cand.line} ${p.cand.market} (${fmtOdds(p.cand.overOdds)}) · conviction ${p.conviction}/10 · ${p.why||''}`).join('\n');
     try { await navigator.clipboard.writeText(txt); $('agentCopy').textContent='Copied'; } catch(e){ $('agentCopy').textContent='Copy failed'; } });
-  el.querySelectorAll('[data-pick]').forEach(b=>b.onclick=()=>{ const p = R.picks[+b.dataset.pick]; S.market = p.cand.mkey; selectPlayer(p.cand.pid); $('detail').scrollIntoView({behavior:'smooth', block:'start'}); });
+  el.querySelectorAll('[data-pick]').forEach(b=>b.onclick=()=>{ const [gid, i] = b.dataset.pick.split(':'); const p = resultFor(gid)?.picks?.[+i]; if(!p) return; S.market = p.cand.mkey; selectPlayer(p.cand.pid); $('detail').scrollIntoView({behavior:'smooth', block:'start'}); });
+}
+
+// ===== MATCHUP BOARD (slate-wide view for every visitor) =====
+const MB = { open: lsGet('dkat-mb-open') ?? true };
+function renderMatchupBoard(){
+  const el = $('matchupBoard'); if(!el) return;
+  const head = `<div class="flex items-center gap-3 flex-wrap">
+      <div class="w-9 h-9 rounded-lg bg-sky-400/10 border border-sky-400/40 grid place-items-center text-sky-300 font-mono font-bold text-xs shrink-0">VS</div>
+      <div class="min-w-0"><h3 class="font-extrabold tracking-tight">Matchup Board</h3>
+        <div class="text-[11px] text-slate-500 font-mono">Where each defense is soft tonight: by position, pace${S.nbacom?', play type and shot zone':''}</div></div>
+      <button id="mbToggle" class="ml-auto text-xs border border-slate-700 hover:border-neon/60 rounded-md px-3 py-2">${MB.open?'Hide':'Show'}</button></div>`;
+  if(!MB.open || !S.games.length){ el.innerHTML = head; wireMB(el); return; }
+  if(BOX.status!=='ready' || !S.match){ el.innerHTML = head + `<div class="py-6 text-center text-slate-500 text-sm"><span class="spin"></span><div class="mt-2 text-xs">Loading this season's box scores (${BOX.done}/${BOX.total||'…'})…</div></div>`; wireMB(el); return; }
+  const games = S.gameFilter==='all' ? S.games : S.games.filter(g=>g.id===S.gameFilter);
+  const mk4 = [['pts','PTS'],['reb','REB'],['ast','AST'],['fg3','3PM']];
+  const defGrid = (t) => {
+    const P = S.match.pos[t.id];
+    if(!P) return `<div class="text-xs text-slate-500">No games yet.</div>`;
+    return `<table class="w-full text-xs"><thead><tr class="text-[10px] uppercase tracking-wider text-slate-500"><th class="text-left py-1 pr-1">vs</th>${mk4.map(([,l])=>`<th class="py-1 px-0.5">${l}</th>`).join('')}</tr></thead><tbody>
+      ${['G','F','C'].map(pos=>`<tr><td class="py-1 pr-1 font-semibold text-slate-400">${pos}</td>${mk4.map(([k])=>{ const r = P[pos]?.rank?.[k]; return `<td class="py-1 px-0.5 text-center"><span class="pill ${rankClass(r)}" style="padding:1px 6px" title="${P[pos]?.val?.[k]?.toFixed(1)??''} per game">${r??'—'}</span></td>`; }).join('')}</tr>`).join('')}
+    </tbody></table>`;
+  };
+  const weakSpots = (t) => {
+    const td = S.nbacom?.teams?.[t.abbr]; if(!td) return '';
+    const pt = Object.entries(td.ptDef||{}).filter(([,v])=>v[1]!=null).sort((a,b)=>b[1][1]-a[1][1]).slice(0,3).map(([k,v])=>`${esc(PT_LABEL[k]||k)} <b class="${v[1]>=21?'text-neon':v[1]<=10?'text-red-400':'text-yellow-300'}">#${v[1]}</b>`);
+    const zn = Object.entries(td.zoneDef||{}).filter(([k,v])=>v[2]!=null && k!=='C3').sort((a,b)=>b[1][2]-a[1][2]).slice(0,2).map(([k,v])=>`${esc(ZONE_LABEL[k]||k)} <b class="${v[2]>=21?'text-neon':'text-yellow-300'}">#${v[2]}</b>`);
+    return `<div class="mt-2 text-[11px] text-slate-400 leading-relaxed">${pt.length?`Softest vs play types: ${pt.join(' · ')}`:''}${zn.length?`<br/>Softest shot zones: ${zn.join(' · ')}`:''}</div>`;
+  };
+  const spots = (g) => {
+    const rows = [];
+    for(const [id,P] of Object.entries(S.props)){
+      if(P.gameId!==g.id) continue; const p = S.players[id]; if(!p || (p.injury && /out/i.test(p.injury))) continue;
+      for(const mk of MARKETS){ const m = P.markets[mk.key]; if(!m) continue; const mu = matchupFor(p, mk.key); if(mu.score==null) continue;
+        const L = S.logs[id]; const l10 = L?.status==='ok' ? L.games.slice(0,10) : [];
+        rows.push({ id, p, mk, m, mu, hit: l10.length ? l10.filter(x=>mk.f(x)>m.line).length + '/' + l10.length : '' }); }
+    }
+    const seen = new Set();
+    return rows.sort((a,b)=>b.mu.score-a.mu.score).filter(r=>!seen.has(r.id) && seen.add(r.id)).slice(0,5);
+  };
+  const card = g => {
+    const pa = S.match.pace[g.away.id], ph = S.match.pace[g.home.id];
+    const sp = spots(g);
+    return `<div class="rounded-xl border border-slate-700 bg-slate-900/50 p-4 min-w-0">
+      <div class="flex items-center gap-2 flex-wrap"><span class="font-extrabold">${esc(g.away.abbr)} @ ${esc(g.home.abbr)}</span><span class="text-[11px] font-mono text-slate-500">${g.status.state && g.status.state!=='pre' ? 'started' : fmtTime(g.date)}${g.total?' · O/U '+g.total:''}</span>
+        <span class="ml-auto text-[11px] font-mono text-slate-400">Pace ${esc(g.away.abbr)} <b class="${pa&&pa.rank<=10?'text-neon':pa&&pa.rank>=21?'text-red-400':'text-yellow-300'}">#${pa?.rank??'—'}</b> · ${esc(g.home.abbr)} <b class="${ph&&ph.rank<=10?'text-neon':ph&&ph.rank>=21?'text-red-400':'text-yellow-300'}">#${ph?.rank??'—'}</b></span></div>
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-3">
+        ${[g.home, g.away].map(t=>`<div class="min-w-0"><div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">${esc(t.abbr)} defense allows (rank, 30 = softest)</div>${defGrid(t)}${weakSpots(t)}</div>`).join('')}
+      </div>
+      ${sp.length ? `<div class="mt-3"><div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Best matchup spots with a DK line</div>
+        <div class="flex flex-col gap-1">${sp.map(r=>`<button data-mb="${r.id}:${r.mk.key}" class="text-left text-xs flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-slate-800/60">
+          <span class="font-mono font-bold w-8 text-neon">${Math.round(r.mu.score*100)}</span>
+          <span class="font-semibold truncate">${esc(r.p.name)}</span>
+          <span class="pill pill-hit" style="padding:1px 7px">O ${r.m.line} ${esc(r.mk.label)}</span>
+          <span class="text-slate-500 font-mono hidden sm:inline">vs ${r.mu.pg}s #${r.mu.posRank??'—'}${r.hit?' · L10 '+r.hit:''}</span></button>`).join('')}</div>
+        <div class="text-[10px] text-slate-600 mt-1">Score 0–100 blends defense vs his position, team defense and both teams' pace. It isn't a pick on its own.</div></div>` : ''}
+    </div>`;
+  };
+  el.innerHTML = head + `<div class="grid grid-cols-1 xl:grid-cols-2 gap-3 mt-4">${games.map(card).join('')}</div>`;
+  wireMB(el);
+}
+function wireMB(el){
+  const t = $('mbToggle'); if(t) t.onclick = () => { MB.open = !MB.open; lsSet('dkat-mb-open', MB.open); renderMatchupBoard(); };
+  el.querySelectorAll('[data-mb]').forEach(b=>b.onclick=()=>{ const [id,mk] = b.dataset.mb.split(':'); S.market = mk; selectPlayer(id); $('detail').scrollIntoView({behavior:'smooth', block:'start'}); });
 }
 
 // ===== SEARCH =====
@@ -1339,7 +1422,7 @@ $('refreshBtn').onclick = async () => {
   Object.keys(S.props).forEach(id=>loadLog(id));
   S.playerId = keep; renderAll();
 };
-$('datePick').onchange = e => { if(e.target.value){ S.date = e.target.value; loadSlate(); } };
+$('datePick').onchange = e => { if(e.target.value){ S.date = e.target.value; loadSlate().then(loadPublishedPicks); } };
 
 (function boot(){
   const now = new Date();
@@ -1349,8 +1432,9 @@ $('datePick').onchange = e => { if(e.target.value){ S.date = e.target.value; loa
   try { const sv = lsGet('dkat-prefs'); if(sv?.market && MK[sv.market]) S.market = sv.market; if(sv?.sort) { S.sort = sv.sort; $('boardSort').value = sv.sort; } } catch(e){}
   window.addEventListener('beforeunload', ()=>lsSet('dkat-prefs', { market:S.market, sort:S.sort }));
   renderAll();
-  loadSlate();
+  loadSlate().then(loadPublishedPicks);
   loadNbaCom();
+  setInterval(()=>{ if(!document.hidden) loadPublishedPicks(); }, 10*60*1000);
   // auto-refresh lines every 5 minutes
   setInterval(()=>{ if(!document.hidden && S.games.some(g=>!g.status.completed)) $('refreshBtn').click(); }, 5*60*1000);
 })();

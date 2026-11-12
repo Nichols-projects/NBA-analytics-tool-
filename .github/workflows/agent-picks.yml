@@ -1,0 +1,42 @@
+name: Daily agent picks
+
+on:
+  schedule:
+    - cron: "37 17 * * *"     # about 10:37 AM Arizona time
+    - cron: "17 22 * * *"     # about 3:17 PM Arizona time, before the first tips
+  workflow_dispatch:           # "Run workflow" button on the Actions tab
+
+permissions:
+  contents: write
+
+concurrency:
+  group: agent-picks
+  cancel-in-progress: false
+
+jobs:
+  picks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install headless browser
+        run: |
+          npm install --no-save playwright@1.49.1
+          npx playwright install --with-deps chromium
+      - name: Run the agent team on today's games
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PICKS_PER_GAME: "3"
+        run: node scripts/run_agents_bot.mjs
+      - name: Publish picks.json
+        run: |
+          git config user.name "agent-picks-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add picks.json
+          git diff --cached --quiet && echo "No changes" && exit 0
+          git commit -m "Publish agent picks"
+          git pull --rebase origin main
+          git push
