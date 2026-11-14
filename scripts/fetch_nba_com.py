@@ -4,19 +4,26 @@ Downloads play types (Synergy), player tracking, shot zones and usage from
 stats.nba.com and writes a compact nba-com.json that the web app reads.
 Standard library only, so it runs anywhere Python 3.9+ is installed.
 """
-import json, sys, time, unicodedata, re, urllib.request, urllib.parse
+import gzip, json, os, re, shutil, subprocess, sys, time, unicodedata, urllib.parse, urllib.request, zlib
 from datetime import datetime, timezone
 
+# Same headers a browser sends when nba.com loads its own stats pages.
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Host": "stats.nba.com",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate",
     "Referer": "https://www.nba.com/",
     "Origin": "https://www.nba.com",
-    "x-nba-stats-origin": "stats",
-    "x-nba-stats-token": "true",
+    "Sec-Fetch-Site": "same-site",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Dest": "empty",
+    "Pragma": "no-cache",
+    "Cache-Control": "no-cache",
     "Connection": "keep-alive",
 }
+METHOD = None  # "python" or "curl", whichever NBA.com accepts first
 BASE = "https://stats.nba.com/stats/"
 NBA_TO_ESPN = {"GSW": "GS", "NYK": "NY", "SAS": "SA", "NOP": "NO", "UTA": "UTAH", "WAS": "WSH"}
 TEAM_IDS = {1610612737: "ATL", 1610612738: "BOS", 1610612751: "BKN", 1610612766: "CHA", 1610612741: "CHI",
@@ -48,13 +55,55 @@ def team(abbr):
     return NBA_TO_ESPN.get(abbr, abbr)
 
 
+def _python_get(url, timeout):
+    req = urllib.request.Request(url, headers=HEADERS)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        body, enc = r.read(), (r.headers.get("Content-Encoding") or "").lower()
+    if enc == "gzip":
+        body = gzip.decompress(body)
+    elif enc == "deflate":
+        body = zlib.decompress(body)
+    return json.loads(body.decode("utf-8"))
+
+
+def _curl_get(url, timeout):
+    # Windows 10/11 ships curl.exe, which uses Windows' own TLS like a browser does.
+    curl = shutil.which("curl.exe") or shutil.which("curl")
+    if not curl:
+        raise RuntimeError("curl not available")
+    cmd = [curl, "-sS", "--compressed", "-m", str(timeout)]
+    for k, v in HEADERS.items():
+        if k not in ("Host", "Accept-Encoding", "Connection"):
+            cmd += ["-H", f"{k}: {v}"]
+    out = subprocess.run(cmd + [url], capture_output=True, timeout=timeout + 10)
+    if out.returncode != 0:
+        raise RuntimeError((out.stderr or b"").decode(errors="ignore").strip() or f"curl exit {out.returncode}")
+    return json.loads(out.stdout.decode("utf-8"))
+
+
+def fetch(url, timeout=45):
+    """Try plain Python first, then Windows curl; remember whichever works."""
+    global METHOD
+    order = [METHOD] if METHOD else ["python", "curl"]
+    last = None
+    for m in order:
+        try:
+            data = (_python_get if m == "python" else _curl_get)(url, timeout)
+            if METHOD != m:
+                print(f"  connected to NBA.com using {m}", flush=True)
+            METHOD = m
+            return data
+        except Exception as e:  # noqa: BLE001
+            last = e
+            print(f"  {m} request failed: {e}", flush=True)
+    raise last
+
+
 def get(endpoint, params, tries=3):
     url = BASE + endpoint + "?" + urllib.parse.urlencode(params)
     for attempt in range(tries):
         try:
-            req = urllib.request.Request(url, headers=HEADERS)
-            with urllib.request.urlopen(req, timeout=45) as r:
-                data = json.loads(r.read().decode("utf-8"))
+            data = fetch(url)
             time.sleep(1.2)  # be polite
             return data
         except Exception as e:  # noqa: BLE001
@@ -96,8 +145,7 @@ def main():
     ok = False
     for ep, q in (("commonteamyears", {"LeagueID": "00"}), ("leaguestandingsv3", {"LeagueID": "00", "Season": season, "SeasonType": "Regular Season"})):
         try:
-            req = urllib.request.Request(BASE + ep + "?" + urllib.parse.urlencode(q), headers=HEADERS)
-            urllib.request.urlopen(req, timeout=40).read()
+            fetch(BASE + ep + "?" + urllib.parse.urlencode(q), timeout=40)
             ok = True
             break
         except Exception as e:  # noqa: BLE001
