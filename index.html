@@ -504,7 +504,7 @@ function fairOver(m){
 }
 // ===== PROJECTION MODEL =====
 // Projected minutes x production per minute, adjusted for matchup, pace, teammates out and blowout risk,
-// turned into a chance the Over hits, lightly blended (20%) with the market's fair price.
+// turned into a chance the Over hits, blended 70/30 with the market's fair price (books are usually close).
 const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
 function normCdf(x){ const t = 1/(1+0.2316419*Math.abs(x)), d = 0.3989423*Math.exp(-x*x/2);
   const q = d*t*(0.3193815+t*(-0.3565638+t*(1.781478+t*(-1.821256+t*1.330274)))); return x>0 ? 1-q : q; }
@@ -526,17 +526,28 @@ function projectFor(id, mkey, lineOverride){
   let mu = minProj*perMin; const factors = [];
   const pg = posGroup(p.pos);
   const oppAllowed = S.match?.pos?.[p.oppId]?.[pg]?.val?.[mkey], lg = S.match?.lg?.[pg]?.[mkey];
-  if(oppAllowed && lg){ const x = clamp(Math.pow(oppAllowed/lg, 0.5), 0.88, 1.12); mu *= x; factors.push(['Matchup', x]); }
+  if(oppAllowed && lg){ const x = clamp(Math.pow(oppAllowed/lg, 0.5), 0.9, 1.1); mu *= x; factors.push(['Matchup', x]); }
   const op = S.match?.pace?.[p.oppId], tp = S.match?.pace?.[p.teamId];
-  if(op && tp && S.match.lgPace){ const x = clamp(Math.pow(((op.pace+tp.pace)/2)/S.match.lgPace, 0.8), 0.93, 1.07); mu *= x; factors.push(['Pace', x]); }
-  const ww = withWithout(id, p.teamId, mkey).filter(w=>w.gamesWithout>=2 && w.gamesWith>=2 && w.avgWith>0);
-  if(ww.length){ let x = 1; ww.forEach(w=>{ x *= 1 + 0.5*(w.avgWithout/w.avgWith - 1); }); x = clamp(x, 0.9, 1.2); mu *= x; factors.push(['Teammates out', x]); }
+  if(op && tp && S.match.lgPace){ const x = clamp(Math.pow(((op.pace+tp.pace)/2)/S.match.lgPace, 0.8), 0.94, 1.06); mu *= x; factors.push(['Pace', x]); }
+  // Only a NEW absence counts (the teammate played in 2+ of this player's last 5 games); otherwise it's already in his recent numbers.
+  const teamBox = Object.values(BOX.games).map(b=>({ d:b.d, t:b.t.find(t=>t.id===p.teamId) })).filter(x=>x.t && x.t.pl.find(r=>r[0]===id && r[2]))
+    .sort((a,b)=>String(b.d).localeCompare(String(a.d))).slice(0,5);
+  const outs = Object.values(S.players).filter(x=>x.teamId===p.teamId && x.id!==id && x.injury && /out/i.test(x.injury));
+  const newOut = new Set(outs.filter(o=>teamBox.filter(x=>x.t.pl.find(r=>r[0]===o.id && r[2])).length>=2).map(o=>o.name));
+  let usage = 1;
+  withWithout(id, p.teamId, mkey).filter(w=>newOut.has(w.teammate) && w.gamesWithout>=3 && w.gamesWith>=3 && w.avgWith>0)
+    .forEach(w=>{ usage = Math.max(usage, 1 + 0.3*(w.avgWithout/w.avgWith - 1)); });
+  if(usage>1.005){ const x = Math.min(usage, 1.08); mu *= x; factors.push(['Teammates out', x]); }
   const g = S.games.find(x=>x.id===p.gameId), spr = parseFloat(String(g?.spread||'').match(/-?\d+(\.\d+)?/)?.[0]);
   if(!isNaN(spr) && Math.abs(spr)>=11 && minProj>=28){ mu *= 0.96; factors.push(['Blowout risk', 0.96]); }
   const v20 = G.slice(0,20).map(f), a20 = avg(v20), sd = Math.sqrt(avg(v20.map(x=>(x-a20)**2)));
-  const pRaw = (mkey==='fg3' || mu<4) ? poissonOver(mu, line) : 1 - normCdf((Math.floor(line)+0.5 - mu) / Math.max(Math.sqrt(mu)*1.15, sd*0.85, 1));
+  // Counting stats are right-skewed (big nights pull the average above a typical night), so use a log-normal curve; Poisson for small counts.
+  let pRaw;
+  if(mkey==='fg3' || mu<4) pRaw = poissonOver(mu, line);
+  else { const sig = Math.max(Math.sqrt(mu)*1.15, sd*0.9, 1), s2 = Math.log(1 + (sig*sig)/(mu*mu)), lm = Math.log(mu) - s2/2;
+    pRaw = 1 - normCdf((Math.log(Math.floor(line)+0.5) - lm) / Math.sqrt(s2)); }
   const fair = fairOver(S.props[id]?.markets?.[mkey]);
-  const pm = clamp(fair!=null ? 0.8*pRaw + 0.2*fair : pRaw, 0.02, 0.98);
+  const pm = clamp(fair!=null ? 0.7*pRaw + 0.3*fair : pRaw, 0.02, 0.98);   // lean 30% on the market: books are usually close
   const out = { mu, minProj, perMin, factors, pRaw, p: pm, fair, edge: fair!=null ? pm-fair : null, line };
   MODEL_CACHE.set(ck, out); return out;
 }
