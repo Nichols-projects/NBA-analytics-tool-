@@ -107,7 +107,7 @@
 
   <footer class="text-center text-[11px] text-slate-600 py-6 leading-relaxed">
     Live data: ESPN public feeds (DraftKings is ESPN's odds provider). Not affiliated with DraftKings, ESPN or the NBA. Lines can move or be pulled at any time, so confirm in the DK app before betting.<br/>
-    For research and entertainment. Gambling problem? Call 1-800-GAMBLER. · <span class="font-mono">v2.1</span>
+    For research and entertainment. Gambling problem? Call 1-800-GAMBLER. · <span class="font-mono">v2.2</span>
   </footer>
 </main>
 
@@ -502,6 +502,62 @@ function fairOver(m){
   const io = implied(m.over), iu = implied(m.under);
   return io/(io+iu);
 }
+// ===== REFEREES + BLOWOUTS (refs.json, rebuilt daily by the GitHub job from two seasons of box scores) =====
+async function loadRefs(){
+  for(const u of ['https://raw.githubusercontent.com/Nichols-projects/NBA-analytics-tool-/main/refs.json', 'refs.json']){
+    try { const r = await fetch(u + '?m=' + Math.floor(Date.now()/600000)); if(!r.ok) continue; const j = await r.json(); if(j?.refs){ S.refs = j; scheduleRender(); return; } } catch(e){}
+  }
+}
+function crewFor(gameId){ return S.refs?.today?.[gameId] || null; }
+function teamExpMargin(p){
+  const g = S.games.find(x=>x.id===p.gameId); const m = String(g?.spread||'').match(/([A-Z]+)\s*([+-]?\d+(\.\d+)?)/);
+  if(!g) return null;
+  if(!m){ return /even|pk/i.test(String(g.spread||'')) ? 0 : null; }
+  const fav = m[1], pts = Math.abs(parseFloat(m[2]));
+  const favIsMine = fav===p.team;   // spread string uses ESPN abbreviations, same as the app
+  return favIsMine ? pts : -pts;
+}
+// Chance the game is out of hand entering the 4th (15+), and what that does to this player's minutes.
+function blowoutFor(p){
+  const B = S.refs?.blowout; if(!B) return null;
+  const exp = teamExpMargin(p); if(exp==null) return null;
+  const mu3 = B.slope * exp, sd = B.sd || 11, cut = B.lopsided || 15;
+  let pA = 1 - normCdf((cut - mu3)/sd), pB = normCdf((-cut - mu3)/sd);
+  const T = B.teams || {}, tl = Object.values(T), lgA = avg(tl.map(t=>t.aheadRate||0)), lgB = avg(tl.map(t=>t.behindRate||0));
+  const me = T[p.teamId], opp = T[p.oppId], w = t => t ? t.games/(t.games+20) : 0;
+  // each team's own habit of running away with games or collapsing late, shrunk toward league average
+  if(me && opp && lgA && lgB){
+    pA *= clamp(1 + w(me)*((me.aheadRate/lgA)-1)*0.5 + w(opp)*((opp.behindRate/lgB)-1)*0.5, 0.7, 1.4);
+    pB *= clamp(1 + w(me)*((me.behindRate/lgB)-1)*0.5 + w(opp)*((opp.aheadRate/lgA)-1)*0.5, 0.7, 1.4);
+  }
+  // injuries: a depleted roster is more likely to fold late (rotation players out)
+  const outCount = tid => Object.values(S.players).filter(x=>x.teamId===tid && x.injury && /out/i.test(x.injury) && (B.players?.[x.id]?.base||0)>=20).length;
+  const myOut = outCount(p.teamId), oppOut = outCount(p.oppId);
+  if(oppOut>=2) pA *= 1 + 0.12*(oppOut-1);
+  if(myOut>=2) pB *= 1 + 0.12*(myOut-1);
+  pA = clamp(pA, 0, 0.7); pB = clamp(pB, 0, 0.7);
+  const rec = B.players?.[p.id];
+  const starter = rec ? rec.starterShare>=0.5 : true;
+  const defA = starter ? (me?.starterRatioAhead ?? 0.85) : 1.12, defB = starter ? (me?.starterRatioBehind ?? 0.92) : 1.06;
+  const mix = (own, def) => own ? (own[0]/(own[0]+6))*own[1] + (6/(own[0]+6))*def : def;
+  const rA = mix(rec?.ahead, defA), rB = mix(rec?.behind, defB);
+  const hA = me?.aheadRate ?? lgA ?? 0.1, hB = me?.behindRate ?? lgB ?? 0.1;   // how often his past games already included lopsided ones
+  const factor = clamp(1 + pA*(rA-1) + pB*(rB-1) - (hA*(rA-1) + hB*(rB-1)), 0.85, 1.08);
+  return { pA, pB, rA, rB, factor, starter, nA: rec?.ahead?.[0]||0, nB: rec?.behind?.[0]||0, base: rec?.base, myOut, oppOut, exp };
+}
+function refEffect(id, p, mkey, mu){
+  const c = crewFor(p.gameId)?.crew, L = S.refs?.league; if(!c || !L) return null;
+  const G = S.logs[id]?.games || [];
+  let x = 1;
+  if(['pts','pra','pr','pa'].includes(mkey) && G.length){
+    const ftm = avg(G.slice(0,20).map(g=>g.ftm||0)), rel = c.fta / L.fta;      // crew's extra free throws, as a share of a normal game
+    x *= mu>0 ? (mu + ftm*rel)/mu : 1;
+  }
+  const fp36 = S.refs?.blowout?.players?.[id]?.foulsPer36;
+  if(fp36!=null && fp36>=4 && c.fouls>=1.5) x *= clamp(1 - 0.01*c.fouls*(fp36-3.5), 0.95, 1);   // foul-prone player + whistle-heavy crew
+  return clamp(x, 0.95, 1.05);
+}
+
 // ===== PROJECTION MODEL =====
 // Projected minutes x production per minute, adjusted for matchup, pace, teammates out and blowout risk,
 // turned into a chance the Over hits, blended 70/30 with the market's fair price (books are usually close).
@@ -514,7 +570,7 @@ function projectFor(id, mkey, lineOverride){
   const L = S.logs[id], p = S.players[id];
   if(!L || L.status!=='ok' || !p || L.games.length<5) return null;
   const line = lineOverride ?? lineFor(id, mkey); if(line==null) return null;
-  const ck = `${id}|${mkey}|${line}|${L.games.length}|${BOX.status}|${S.match?1:0}`;
+  const ck = `${id}|${mkey}|${line}|${L.games.length}|${BOX.status}|${S.match?1:0}|${S.refs?1:0}`;
   if(MODEL_CACHE.has(ck)) return MODEL_CACHE.get(ck);
   const f = MK[mkey].f, G = L.games, cur = G.filter(g=>g.season===S.season), prev = G.filter(g=>g.season===S.season-1);
   const mAvg = a => a.length ? avg(a.map(g=>g.min)) : null;
@@ -538,8 +594,12 @@ function projectFor(id, mkey, lineOverride){
   withWithout(id, p.teamId, mkey).filter(w=>newOut.has(w.teammate) && w.gamesWithout>=3 && w.gamesWith>=3 && w.avgWith>0)
     .forEach(w=>{ usage = Math.max(usage, 1 + 0.3*(w.avgWithout/w.avgWith - 1)); });
   if(usage>1.005){ const x = Math.min(usage, 1.08); mu *= x; factors.push(['Teammates out', x]); }
-  const g = S.games.find(x=>x.id===p.gameId), spr = parseFloat(String(g?.spread||'').match(/-?\d+(\.\d+)?/)?.[0]);
-  if(!isNaN(spr) && Math.abs(spr)>=11 && minProj>=28){ mu *= 0.96; factors.push(['Blowout risk', 0.96]); }
+  const bo = blowoutFor(p);
+  if(bo){ if(Math.abs(bo.factor-1)>=0.005){ mu *= bo.factor; factors.push(['Blowout', bo.factor]); } }
+  else { const g = S.games.find(x=>x.id===p.gameId), spr = parseFloat(String(g?.spread||'').match(/-?\d+(\.\d+)?/)?.[0]);
+    if(!isNaN(spr) && Math.abs(spr)>=11 && minProj>=28){ mu *= 0.96; factors.push(['Blowout risk', 0.96]); } }
+  const rx = refEffect(id, p, mkey, mu);
+  if(rx && Math.abs(rx-1)>=0.005){ mu *= rx; factors.push(['Refs', rx]); }
   const v20 = G.slice(0,20).map(f), a20 = avg(v20), sd = Math.sqrt(avg(v20.map(x=>(x-a20)**2)));
   // Counting stats are right-skewed (big nights pull the average above a typical night), so use a log-normal curve; Poisson for small counts.
   let pRaw;
@@ -980,10 +1040,40 @@ function matchupHTML(id, p, mk){
       <div class="rounded-lg border border-slate-700 bg-slate-900/60 p-3"><div class="text-[10px] uppercase tracking-wider text-slate-500">${esc(p.team)} pace</div><div class="flex items-end justify-between mt-1"><span class="text-xl font-extrabold font-mono">${mp?mp.pace.toFixed(1):'—'}</span><span class="pill ${mp?(mp.rank<=10?'pill-fav':mp.rank>=21?'pill-tough':'pill-neut'):'pill-dim'}">#${mp?.rank??'—'}</span></div></div>
     </div>
     <p class="text-[10px] text-slate-500 mt-1">Pace = possessions per game, rank 1 = fastest. Faster games mean more stats to go around.</p>
+    ${refsBlowoutHTML(id, p, mk)}
     ${nbaComHTML(p)}
     <div class="mt-4"><div class="text-[11px] uppercase tracking-wider text-slate-500 mb-1">${mk.label} with and without teammates out tonight</div>
       ${ww.length ? `<div class="overflow-x-auto scroll-thin"><table class="w-full text-sm"><thead><tr class="text-left text-[10px] uppercase tracking-wider text-slate-500 border-b border-slate-800"><th class="py-1.5 pr-2">Teammate</th><th class="py-1.5 pr-2">Without</th><th class="py-1.5 pr-2">With</th><th class="py-1.5">Change</th></tr></thead><tbody>${wwRows}</tbody></table></div>` : `<div class="text-xs text-slate-500">No teammates ruled out tonight.</div>`}
     </div>`;
+}
+
+function crewLine(gameId, compact){
+  const c = crewFor(gameId);
+  if(!S.refs) return '';
+  if(!c || !c.officials?.length) return `<span class="text-slate-500">Refs: not announced yet (the NBA posts crews about 7 AM Arizona time)</span>`;
+  const g = c.crew, sgn = v => (v>=0?'+':'')+v.toFixed(1);
+  const cls = !g ? 'pill-dim' : g.label==='Whistle-heavy' ? 'pill-hit' : g.label==='Lets them play' ? 'pill-miss' : 'pill-neut';
+  return `<span class="text-slate-400">Refs: ${c.officials.map(esc).join(', ')}</span>${g?` <span class="pill ${cls}" style="padding:1px 7px">${g.label}</span> <span class="font-mono text-slate-400">${sgn(g.fouls)} fouls · ${sgn(g.fta)} FTA · ${sgn(g.pts)} pts${compact?'':' vs avg'} · overs ${Math.round(g.overPct*100)}%</span>`:''}`;
+}
+function refsBlowoutHTML(id, p, mk){
+  if(!S.refs) return `<div class="mt-4 text-[11px] text-slate-500">Referee and blowout data loads once the daily data job has run.</div>`;
+  const bo = blowoutFor(p), c = crewFor(p.gameId), L = S.refs.league;
+  const pctx = x => Math.round(x*100)+'%';
+  const boHTML = bo ? `<div class="rounded-lg border border-slate-700 bg-slate-900/60 p-3 min-w-0">
+      <div class="text-[10px] uppercase tracking-wider text-slate-500">Blowout check (margin entering the 4th)</div>
+      <div class="flex flex-wrap gap-x-4 gap-y-1 mt-1 text-sm"><span>${esc(p.team)} up 15+: <b class="font-mono">${pctx(bo.pA)}</b></span><span>down 15+: <b class="font-mono">${pctx(bo.pB)}</b></span></div>
+      <div class="text-xs text-slate-400 mt-1.5 leading-relaxed">${bo.base?`Usually ${bo.base} min in close games. `:''}When ahead big he plays <b class="text-slate-200">${Math.round(bo.rA*100)}%</b> of that${bo.nA?` (${bo.nA} games)`:' (typical for his role)'}; when behind big, <b class="text-slate-200">${Math.round(bo.rB*100)}%</b>${bo.nB?` (${bo.nB} games)`:''}.
+        ${bo.oppOut>=2?` ${esc(p.opp)} is missing ${bo.oppOut} rotation players, so a late collapse is more likely.`:''}${bo.myOut>=2?` ${esc(p.team)} is missing ${bo.myOut} rotation players.`:''}</div>
+      <div class="text-xs mt-1.5">Effect on projection: <b class="${bo.factor>=1?'text-neon':'text-red-400'}">${bo.factor>=1?'+':''}${((bo.factor-1)*100).toFixed(1)}%</b></div></div>` : '';
+  const g = c?.crew;
+  const cell = (lab, v, unit, good) => `<div><div class="text-[10px] uppercase tracking-wider text-slate-500">${lab}</div><div class="font-mono font-bold ${v==null?'text-slate-500':good==null?'':good?'text-neon':'text-red-400'}">${v==null?'—':(v>=0?'+':'')+v.toFixed(1)+unit}</div></div>`;
+  const refHTML = `<div class="rounded-lg border border-slate-700 bg-slate-900/60 p-3 min-w-0">
+      <div class="text-[10px] uppercase tracking-wider text-slate-500">Referee crew</div>
+      <div class="text-xs mt-1">${crewLine(p.gameId)}</div>
+      ${g?`<div class="grid grid-cols-4 gap-2 mt-2">${cell('Fouls', g.fouls, '', null)}${cell('Free throws', g.fta, '', g.fta>0)}${cell('Points', g.pts, '', g.pts>0)}<div><div class="text-[10px] uppercase tracking-wider text-slate-500">Overs</div><div class="font-mono font-bold">${Math.round(g.overPct*100)}%</div></div></div>
+        <div class="text-[10px] text-slate-500 mt-1.5">Per game vs league average (${L.f.toFixed(0)} fouls, ${L.fta.toFixed(0)} FTA, ${L.pts.toFixed(0)} pts), from ${g.games} games these refs worked over two seasons${g.known<3?`; ${3-g.known} ref${g.known===2?'':'s'} without enough history`:''}.</div>`:''}
+    </div>`;
+  return `<div class="mt-4 grid grid-cols-1 lg:grid-cols-2 gap-2">${refHTML}${boHTML}</div>`;
 }
 
 function nbaComHTML(p){
@@ -1233,6 +1323,8 @@ function buildCandidates(gameId, maxN=25){
         oppPace: mu.oppPace, oppPaceRank: mu.oppPaceRank, teamPaceRank: mu.teamPaceRank,
         matchupScore: mu.score==null ? null : Math.round(mu.score*100), trendScore: Math.round(blend*100),
         nbaCom: nbaSummary(p),
+        refCrew: (()=>{ const c = crewFor(p.gameId); return c?.crew ? { officials:c.officials, label:c.crew.label, foulsVsAvg:c.crew.fouls, ftaVsAvg:c.crew.fta, pointsVsAvg:c.crew.pts, gamesOverTotalPct: Math.round(c.crew.overPct*100) } : null; })(),
+        blowout: (()=>{ const b = blowoutFor(p); return b ? { teamUp15EnteringQ4Pct: Math.round(b.pA*100), teamDown15EnteringQ4Pct: Math.round(b.pB*100), minutesShareIfAhead: +b.rA.toFixed(2), minutesShareIfBehind: +b.rB.toFixed(2), projectionEffectPct: +((b.factor-1)*100).toFixed(1) } : null; })(),
         model: pr ? { projection:+pr.mu.toFixed(1), minutesProj:+pr.minProj.toFixed(1), overPct: Math.round(pr.p*100), edgePts: pr.edge!=null ? Math.round(pr.edge*100) : null, adjustments: Object.fromEntries(pr.factors.map(([n,x])=>[n, `${x>=1?'+':''}${Math.round((x-1)*100)}%`])) } : null,
         withoutTeammates: ww.map(({valsWithout, ...x})=>({ ...x, overHitsWithout: `${valsWithout.filter(v=>v>m.line).length}/${valsWithout.length}` }))
       }});
@@ -1257,14 +1349,16 @@ All data is real, pulled tonight from ESPN box scores and DraftKings for ONE gam
 - model: the app's projection (projected minutes x production per minute, adjusted for matchup, pace, teammates out and blowout risk). overPct = its chance the Over hits; edgePts = overPct minus DraftKings' fair price. It is the best single number here, but it can't see late news or scheme details, so adjust it for those.
 - matchupScore (0-100, higher = friendlier) and trendScore (0-100) are the app's own quick formulas; form your own view.
 - nbaCom (when present, from NBA.com): playTypes = his main play types (freqPct of his possessions, ppp = points per possession) vs the opponent's defense on that play type (oppDefPPP allowed and oppDefRank: 1 = allows the fewest points per possession, toughest; 30 = most, softest). shotZones = where he shoots (share of his shots, his FG%) vs the opponent's FG% allowed in that zone (oppZoneRank 1 = toughest, 30 = softest). tracking: rebChances = rebound opportunities per game (the volume behind rebound props), potAst = potential assists per game (passes that led to shots; far above his assists means assists should rise), touches, drives, catch-and-shoot and pull-up attempts. usagePct vs usagePctL5 shows whether his role is growing.
+- blowout: chance his team is up or down 15+ entering the 4th quarter (when coaches start pulling starters), his share of normal minutes in those games, and the effect already applied to the model. Bad teams often compete early and fold late, so this is about the 4th quarter, not the final score.
+- refCrew: tonight's referees vs league average (fouls, free-throw attempts, points per game, and how often their games went over the closing total). Whistle-heavy crews help players who live at the line and hurt foul-prone bigs' minutes. It's a supporting factor, not a main reason.
 - recon (when present): live notes from a web search tonight about injuries, lineups and each team's defensive scheme. Trust it for news; ignore anything it marks as not found.
 Early-season ranks use small samples; say so when it matters. Use only the data provided, never invent stats or news. Be concise and specific. Respond with JSON only.`;
 
 const AGENT_PROMPTS = {
   scout: `You are Scout, the LEAD Matchup analyst. Your grade carries the most weight with Chief.
-Build every read in this order: (1) position matchup: oppPosRankVsMarket and oppAllowedToPosPerGame for his position and this stat; (1b) when nbaCom is present: his top play types vs the opponent's rank guarding them, his main shot zones vs their zone defense, and for rebound/assist props the tracking volume (rebChances, potAst); (2) pace of both teams; (3) usage shifts from injuries using withoutTeammates, NEW absences first; (4) defensive scheme and late news from recon (examples: drop coverage gives ball handlers pull-up looks and lets bigs rebound; switch-heavy teams invite isolation scoring; zone limits rim attempts and gives up threes; elite rim protection hurts interior scorers; poor defensive rebounding helps opposing bigs); (5) game script: spread, total, blowout risk to his minutes; (6) rest. Use trends only as a tiebreaker.
+Build every read in this order: (1) position matchup: oppPosRankVsMarket and oppAllowedToPosPerGame for his position and this stat; (1b) when nbaCom is present: his top play types vs the opponent's rank guarding them, his main shot zones vs their zone defense, and for rebound/assist props the tracking volume (rebChances, potAst); (2) pace of both teams; (3) usage shifts from injuries using withoutTeammates, NEW absences first; (4) defensive scheme and late news from recon (examples: drop coverage gives ball handlers pull-up looks and lets bigs rebound; switch-heavy teams invite isolation scoring; zone limits rim attempts and gives up threes; elite rim protection hurts interior scorers; poor defensive rebounding helps opposing bigs); (5) game script: use blowout (4th-quarter minute risk; injuries make late collapses likelier), plus spread and total; (6) referees: refCrew for free-throw-heavy scorers and foul-prone bigs; (7) rest. Use trends only as a tiebreaker.
 Grade 8-10 only when the matchup actively boosts the Over (for example: his #1 play type faces a bottom-5 defense of it, or his main zone faces a soft zone defense). Grade 4 or lower when the matchup works against it, however hot he is.
-For EVERY candidate return: {"notes":[{"id":"c1","lean":"Over|Pass","grade":1-10,"keyFactor":"position|playtype|zone|tracking|pace|usage|scheme|script|rest","note":"max 25 words, cite the matchup numbers"}]}`,
+For EVERY candidate return: {"notes":[{"id":"c1","lean":"Over|Pass","grade":1-10,"keyFactor":"position|playtype|zone|tracking|pace|usage|scheme|script|refs|rest","note":"max 25 words, cite the matchup numbers"}]}`,
   quinn: `You are Quinn, the Quant and the team's sanity check, not the driver. For each prop ask: is tonight's line inside his realistic range? Use averages vs line relative to sdL20 (volatility), minutes stability (minL5 vs minThisSeason), sample sizes, and whether the withoutTeammates numbers are a real sample or noise. When nbaCom tracking is present, use rebChances and potAst as the underlying volume: a rebound line below what his rebound chances support, or potential assists well above his assist average, is a real statistical edge; usagePctL5 above usagePct means a growing role. Flag props where the matchup story needs a level of production he rarely reaches.
 Start from model.overPct and say whether you'd move it up or down and why.
 For EVERY candidate return: {"notes":[{"id":"c1","lean":"Over|Pass","prob":0-100 (chance the Over hits),"grade":1-10,"note":"max 20 words"}]}`,
@@ -1764,6 +1858,7 @@ function renderMatchupBoard(){
     return `<div class="rounded-xl border border-slate-700 bg-slate-900/50 p-4 min-w-0">
       <div class="flex items-center gap-2 flex-wrap"><span class="font-extrabold">${esc(g.away.abbr)} @ ${esc(g.home.abbr)}</span><span class="text-[11px] font-mono text-slate-500">${g.status.state && g.status.state!=='pre' ? 'started' : fmtTime(g.date)}${g.total?' · O/U '+g.total:''}</span>
         <span class="ml-auto text-[11px] font-mono text-slate-400">Pace ${esc(g.away.abbr)} <b class="${pa&&pa.rank<=10?'text-neon':pa&&pa.rank>=21?'text-red-400':'text-yellow-300'}">#${pa?.rank??'—'}</b> · ${esc(g.home.abbr)} <b class="${ph&&ph.rank<=10?'text-neon':ph&&ph.rank>=21?'text-red-400':'text-yellow-300'}">#${ph?.rank??'—'}</b></span></div>
+      ${S.refs?`<div class="mt-2 text-[11px] flex flex-wrap items-center gap-1.5">${crewLine(g.id, true)}</div>`:''}
       <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-3">
         ${[g.home, g.away].map(t=>`<div class="min-w-0"><div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">${esc(t.abbr)} defense allows (rank, 30 = softest)</div>${defGrid(t)}${weakSpots(t)}</div>`).join('')}
       </div>
@@ -1840,6 +1935,7 @@ $('datePick').onchange = e => { if(e.target.value){ S.date = e.target.value; loa
   loadClosingLines();
   $('trackerBtn').onclick = () => { TR.open = !TR.open; if(TR.open){ trGradeAll(); loadClosingLines(); window.scrollTo({top:0, behavior:'smooth'}); } renderAll(); };
   loadNbaCom();
+  loadRefs();
   setInterval(()=>{ if(!document.hidden) loadPublishedPicks(); }, 10*60*1000);
   // auto-refresh lines every 5 minutes
   setInterval(()=>{ if(!document.hidden && S.games.some(g=>!g.status.completed)) $('refreshBtn').click(); }, 5*60*1000);
