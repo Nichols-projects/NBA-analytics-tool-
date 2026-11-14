@@ -50,11 +50,15 @@ def parse_game(sm, ev_id, date):
     if "home" not in sides or "away" not in sides:
         return None
     h, a = sides["home"], sides["away"]
-    hid, aid = h["team"]["id"], a["team"]["id"]
+    hid, aid = (h.get("team") or {}).get("id"), (a.get("team") or {}).get("id")
+    if not hid or not aid:
+        return None
     q = [[int(num(l.get("displayValue"))) for l in (c.get("linescores") or [])] for c in (h, a)]
     tstats = {}
     for t in box.get("teams", []):
-        st = {s["name"]: s.get("displayValue") for s in t.get("statistics", [])}
+        if not (t.get("team") or {}).get("id"):
+            continue
+        st = {s.get("name"): s.get("displayValue") for s in t.get("statistics", [])}
         sp = lambda k: [num(x) for x in str(st.get(k, "0-0")).split("-")] + [0, 0]
         fga, fta = sp("fieldGoalsMade-fieldGoalsAttempted")[1], sp("freeThrowsMade-freeThrowsAttempted")[1]
         poss = fga + 0.44 * fta - num(st.get("offensiveRebounds")) + num(st.get("totalTurnovers") or st.get("turnovers"))
@@ -63,15 +67,21 @@ def parse_game(sm, ev_id, date):
         return None
     pl = []
     for tp in box.get("players", []):
-        side = 0 if tp["team"]["id"] == hid else 1
+        tid = (tp.get("team") or {}).get("id")
+        if tid not in (hid, aid):
+            continue
+        side = 0 if tid == hid else 1
         stt = (tp.get("statistics") or [{}])[0]
         keys = stt.get("keys") or []
         ix = {k: i for i, k in enumerate(keys)}
         for at in stt.get("athletes", []):
+            pid = (at.get("athlete") or {}).get("id")
+            if not pid:
+                continue
             s = at.get("stats") or []
             mins = num(s[ix["minutes"]]) if s and "minutes" in ix else 0
             fouls = int(num(s[ix["fouls"]])) if s and "fouls" in ix else 0
-            pl.append([at["athlete"]["id"], side, mins, 1 if at.get("starter") else 0, fouls])
+            pl.append([pid, side, mins, 1 if at.get("starter") else 0, fouls])
     pc = (sm.get("pickcenter") or [{}])[0] if sm.get("pickcenter") else {}
     exp_home = None  # expected home margin from DraftKings' closing spread
     det = str(pc.get("details") or "")
@@ -125,8 +135,12 @@ def load_season(season, today_az):
         sm = get(f"{ESPN}/summary?event={ev_id}")
         if not sm:
             return None
-        local = datetime.fromisoformat(dt.replace("Z", "+00:00")).astimezone(AZ).strftime("%Y-%m-%d")
-        return parse_game(sm, ev_id, local)
+        try:
+            local = datetime.fromisoformat(dt.replace("Z", "+00:00")).astimezone(AZ).strftime("%Y-%m-%d")
+            return parse_game(sm, ev_id, local)
+        except Exception as e:  # noqa: BLE001  one odd game shouldn't stop the whole build
+            print(f"  skipped game {ev_id}: {e}")
+            return None
 
     with ThreadPoolExecutor(8) as pool:
         for g in pool.map(fetch, todo):
