@@ -1,0 +1,35 @@
+name: Closing lines
+
+# Every 15 minutes from noon to 10:59 PM Arizona time: save DraftKings prop lines for games
+# tipping within 45 minutes, so the tracker can show whether bets beat the closing line.
+# Uses ESPN's public feed; no API keys or secrets needed.
+on:
+  schedule:
+    - cron: "*/15 19-23,0-5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: closing-lines
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Save lines for games about to tip
+        run: python3 scripts/snapshot_closing_lines.py
+      - name: Commit closing-lines.json
+        run: |
+          git config user.name "closing-lines-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          [ -f closing-lines.json ] || exit 0
+          git add closing-lines.json
+          git diff --cached --quiet && echo "No changes" && exit 0
+          git commit -m "Closing lines snapshot"
+          git pull --rebase origin main
+          git push

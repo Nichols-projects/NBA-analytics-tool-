@@ -49,6 +49,7 @@
     </div>
     <div class="md:ml-auto flex items-center gap-2 w-full md:w-auto">
       <input id="datePick" type="date" class="bg-slate-900 border border-slate-700 rounded-lg px-2 py-2 text-sm font-mono outline-none focus:border-neon/60" />
+      <button id="trackerBtn" class="shrink-0 bg-slate-900 border border-slate-700 hover:border-neon/60 rounded-lg px-3 py-2 text-sm font-semibold">Tracker</button>
       <button id="refreshBtn" title="Refresh lines" class="shrink-0 bg-slate-900 border border-slate-700 hover:border-neon/60 rounded-lg px-3 py-2 text-sm font-semibold">↻ Refresh</button>
       <div class="relative flex-1 md:w-80">
         <svg class="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
@@ -66,9 +67,10 @@
 
 <main class="max-w-[1500px] mx-auto px-4 py-5">
   <div id="notice" class="hidden card p-4 mb-5 text-sm"></div>
+  <section id="trackerPanel" class="hidden mb-5"></section>
   <section id="agentPanel" class="card p-4 sm:p-5 mb-5 glow"></section>
   <section id="matchupBoard" class="card p-4 sm:p-5 mb-5"></section>
-  <div class="grid grid-cols-1 xl:grid-cols-12 gap-5">
+  <div id="mainGrid" class="grid grid-cols-1 xl:grid-cols-12 gap-5">
 
     <!-- PROP BOARD -->
     <aside class="xl:col-span-4">
@@ -93,7 +95,7 @@
             <tbody id="boardBody"></tbody>
           </table>
         </div>
-        <p class="text-[10px] text-slate-500 mt-3 leading-relaxed">Hit % = how often he cleared <b>tonight's</b> DK line in past games. Edge = how much more often he went Over in his last 10 than DraftKings' price implies. Positive (green) = the Over looks underpriced; negative (red) = the Over is overpriced, so skip it.</p>
+        <p class="text-[10px] text-slate-500 mt-3 leading-relaxed">Hit % = how often he cleared <b>tonight's</b> DK line in past games. Edge = the model's chance the Over hits minus DraftKings' fair price (vig removed). The model projects minutes × production per minute, adjusted for matchup, pace and teammates out. Green = Over looks underpriced; red = skip it.</p>
       </div>
     </aside>
 
@@ -105,7 +107,7 @@
 
   <footer class="text-center text-[11px] text-slate-600 py-6 leading-relaxed">
     Live data: ESPN public feeds (DraftKings is ESPN's odds provider). Not affiliated with DraftKings, ESPN or the NBA. Lines can move or be pulled at any time, so confirm in the DK app before betting.<br/>
-    For research and entertainment. Gambling problem? Call 1-800-GAMBLER. · <span class="font-mono">v2.0</span>
+    For research and entertainment. Gambling problem? Call 1-800-GAMBLER. · <span class="font-mono">v2.1</span>
   </footer>
 </main>
 
@@ -404,6 +406,8 @@ function computeMatchups(){
   }
   Object.keys(PACE).sort((a,b)=>PACE[b].sum/PACE[b].n - PACE[a].sum/PACE[a].n)
     .forEach((t,i)=> out.pace[t] = { pace: PACE[t].sum/PACE[t].n, rank: i+1 }); // rank 1 = fastest
+  out.lg = {}; for(const pos of ['G','F','C']){ out.lg[pos] = {}; for(const k of Object.keys(comb)) out.lg[pos][k] = avg(teams.map(t=>out.pos[t][pos].val[k])); }
+  out.lgPace = avg(Object.values(out.pace).map(x=>x.pace));
   S.match = out;
 }
 function withWithout(pid, teamId, mkey){
@@ -498,11 +502,56 @@ function fairOver(m){
   const io = implied(m.over), iu = implied(m.under);
   return io/(io+iu);
 }
+// ===== PROJECTION MODEL =====
+// Projected minutes x production per minute, adjusted for matchup, pace, teammates out and blowout risk,
+// turned into a chance the Over hits, lightly blended (20%) with the market's fair price.
+const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+function normCdf(x){ const t = 1/(1+0.2316419*Math.abs(x)), d = 0.3989423*Math.exp(-x*x/2);
+  const q = d*t*(0.3193815+t*(-0.3565638+t*(1.781478+t*(-1.821256+t*1.330274)))); return x>0 ? 1-q : q; }
+function poissonOver(mu, line){ const k = Math.floor(line); let term = Math.exp(-mu), cdf = term; for(let i=1;i<=k;i++){ term *= mu/i; cdf += term; } return Math.max(0, 1-cdf); }
+let MODEL_CACHE = new Map();
+function projectFor(id, mkey, lineOverride){
+  const L = S.logs[id], p = S.players[id];
+  if(!L || L.status!=='ok' || !p || L.games.length<5) return null;
+  const line = lineOverride ?? lineFor(id, mkey); if(line==null) return null;
+  const ck = `${id}|${mkey}|${line}|${L.games.length}|${BOX.status}|${S.match?1:0}`;
+  if(MODEL_CACHE.has(ck)) return MODEL_CACHE.get(ck);
+  const f = MK[mkey].f, G = L.games, cur = G.filter(g=>g.season===S.season), prev = G.filter(g=>g.season===S.season-1);
+  const mAvg = a => a.length ? avg(a.map(g=>g.min)) : null;
+  const l5 = G.slice(0,5), l10 = G.slice(0,10);
+  const minProj = 0.5*mAvg(l5) + 0.3*mAvg(l10) + 0.2*(cur.length>=5 ? mAvg(cur) : mAvg(G.slice(0,20)));
+  const rateOf = a => { const m = a.reduce((t,g)=>t+g.min,0); return m ? a.reduce((t,g)=>t+f(g),0)/m : null; };
+  const parts = [[0.4, rateOf(l10)], [0.35, cur.length>=3 ? rateOf(cur) : null], [0.25, prev.length>=10 ? rateOf(prev) : null]].filter(x=>x[1]!=null);
+  const perMin = parts.reduce((t,x)=>t+x[0]*x[1],0) / parts.reduce((t,x)=>t+x[0],0);
+  let mu = minProj*perMin; const factors = [];
+  const pg = posGroup(p.pos);
+  const oppAllowed = S.match?.pos?.[p.oppId]?.[pg]?.val?.[mkey], lg = S.match?.lg?.[pg]?.[mkey];
+  if(oppAllowed && lg){ const x = clamp(Math.pow(oppAllowed/lg, 0.5), 0.88, 1.12); mu *= x; factors.push(['Matchup', x]); }
+  const op = S.match?.pace?.[p.oppId], tp = S.match?.pace?.[p.teamId];
+  if(op && tp && S.match.lgPace){ const x = clamp(Math.pow(((op.pace+tp.pace)/2)/S.match.lgPace, 0.8), 0.93, 1.07); mu *= x; factors.push(['Pace', x]); }
+  const ww = withWithout(id, p.teamId, mkey).filter(w=>w.gamesWithout>=2 && w.gamesWith>=2 && w.avgWith>0);
+  if(ww.length){ let x = 1; ww.forEach(w=>{ x *= 1 + 0.5*(w.avgWithout/w.avgWith - 1); }); x = clamp(x, 0.9, 1.2); mu *= x; factors.push(['Teammates out', x]); }
+  const g = S.games.find(x=>x.id===p.gameId), spr = parseFloat(String(g?.spread||'').match(/-?\d+(\.\d+)?/)?.[0]);
+  if(!isNaN(spr) && Math.abs(spr)>=11 && minProj>=28){ mu *= 0.96; factors.push(['Blowout risk', 0.96]); }
+  const v20 = G.slice(0,20).map(f), a20 = avg(v20), sd = Math.sqrt(avg(v20.map(x=>(x-a20)**2)));
+  const pRaw = (mkey==='fg3' || mu<4) ? poissonOver(mu, line) : 1 - normCdf((Math.floor(line)+0.5 - mu) / Math.max(Math.sqrt(mu)*1.15, sd*0.85, 1));
+  const fair = fairOver(S.props[id]?.markets?.[mkey]);
+  const pm = clamp(fair!=null ? 0.8*pRaw + 0.2*fair : pRaw, 0.02, 0.98);
+  const out = { mu, minProj, perMin, factors, pRaw, p: pm, fair, edge: fair!=null ? pm-fair : null, line };
+  MODEL_CACHE.set(ck, out); return out;
+}
 function edgeFor(id, mkey){
+  const pr = projectFor(id, mkey);
+  if(pr && pr.edge!=null) return pr.edge;
   const m = S.props[id]?.markets?.[mkey]; const fo = fairOver(m);
   const sp = splits(id, mkey);
   if(fo==null || sp.l10.rate==null || sp.l10.n<5) return null;
   return sp.l10.rate - fo;
+}
+function modelLine(pr, mk){
+  if(!pr) return '';
+  const fx = pr.factors.map(([n,x])=>`${n} ${x>=1?'+':''}${Math.round((x-1)*100)}%`).join(', ');
+  return `Projects <b class="text-slate-200">${pr.mu.toFixed(1)}</b> ${mk.label.toLowerCase()} (${pr.minProj.toFixed(1)} min × ${pr.perMin.toFixed(2)}/min${fx?`; ${fx}`:''})`;
 }
 
 // ===== RENDER =====
@@ -608,15 +657,16 @@ function topPropsHTML(){
       <td class="py-2.5 pr-2 font-mono text-slate-500">${i+1}</td>
       <td class="py-2.5 pr-3"><div class="font-semibold">${esc(p.name)}${p.injury?` <span class="text-[10px] text-yellow-300">${esc(p.injury)}</span>`:''}</div><div class="text-[11px] font-mono text-slate-500">${esc(p.team)} ${p.home?'vs':'@'} ${esc(p.opp)}${g?' · '+(g.status.state && g.status.state!=='pre' ? 'started' : fmtTime(g.date)):''}</div></td>
       <td class="py-2.5 pr-3 font-mono"><b>${r.m.line}</b> <span class="text-[11px] text-slate-500">${fmtOdds(r.m.over)}/${fmtOdds(r.m.under)}</span></td>
-      <td class="py-2.5 pr-3 font-mono text-center">${pct(r.sp.l10)}</td>
-      <td class="py-2.5 pr-3 font-mono text-center hidden sm:table-cell">${pct(r.sp.season)}</td>
+      <td class="py-2.5 pr-3 font-mono text-center">${(()=>{ const pr = projectFor(r.id, S.market); return pr ? `<span class="${pr.mu>r.m.line?'text-neon':'text-red-400'}">${pr.mu.toFixed(1)}</span>` : '<span class="text-slate-600">—</span>'; })()}</td>
+      <td class="py-2.5 pr-3 font-mono text-center">${(()=>{ const pr = projectFor(r.id, S.market); return pr ? `${Math.round(pr.p*100)}%` : '—'; })()}</td>
+      <td class="py-2.5 pr-3 font-mono text-center hidden sm:table-cell">${pct(r.sp.l10)}</td>
       <td class="py-2.5 pr-3 font-mono text-center hidden sm:table-cell">${mu?.score!=null ? `<span class="${mu.score>=0.6?'text-neon':mu.score<=0.4?'text-red-400':'text-yellow-300'}">${Math.round(mu.score*100)}</span>` : '<span class="text-slate-600">—</span>'}</td>
       <td class="py-2.5 text-right"><span class="pill ${ec}">${e==null?'—':(e>0?'+':'')+Math.round(e*100)}</span></td></tr>`;
   }).join('');
   return `<div class="card p-5 fade-in">${head}<div class="overflow-x-auto scroll-thin"><table class="w-full text-sm">
-    <thead><tr class="text-left text-[10px] uppercase tracking-wider text-slate-500 border-b border-slate-800"><th class="py-2 pr-2">#</th><th class="py-2 pr-3">Player</th><th class="py-2 pr-3">DK line</th><th class="py-2 pr-3 text-center">L10</th><th class="py-2 pr-3 text-center hidden sm:table-cell">Season</th><th class="py-2 pr-3 text-center hidden sm:table-cell">Matchup</th><th class="py-2 text-right">Edge</th></tr></thead>
+    <thead><tr class="text-left text-[10px] uppercase tracking-wider text-slate-500 border-b border-slate-800"><th class="py-2 pr-2">#</th><th class="py-2 pr-3">Player</th><th class="py-2 pr-3">DK line</th><th class="py-2 pr-3 text-center">Proj</th><th class="py-2 pr-3 text-center">Model</th><th class="py-2 pr-3 text-center hidden sm:table-cell">L10</th><th class="py-2 pr-3 text-center hidden sm:table-cell">Matchup</th><th class="py-2 text-right">Edge</th></tr></thead>
     <tbody>${body}</tbody></table></div>
-    <p class="text-[10px] text-slate-500 mt-3">Matchup = 0–100 blend of defense vs his position, team defense and pace (higher is friendlier). Edge = L10 hit rate minus DraftKings' no-vig Over chance.</p></div>`;
+    <p class="text-[10px] text-slate-500 mt-3">Matchup = 0–100 blend of defense vs his position, team defense and pace (higher is friendlier). Proj = model projection; Model = its chance the Over hits; Edge = Model minus DraftKings' no-vig Over chance.</p></div>`;
 }
 
 // Plain-language "why is this #1" for the auto-picked Top prop
@@ -624,14 +674,15 @@ function topPropNote(id, p, game, mk, m, sp){
   const fo = fairOver(m), e = edgeFor(id, mk.key);
   const mu = BOX.status==='ready' ? matchupFor(p, mk.key) : null;
   const PN = { G:'guards', F:'forwards', C:'centers' };
-  const bits = [];
-  if(sp.l10.n && m) bits.push(`He cleared ${m.line} in <b class="text-slate-200">${sp.l10.hits} of his last ${sp.l10.n}</b> (${Math.round(sp.l10.rate*100)}%)`);
-  if(fo!=null) bits.push(`DraftKings' price says the Over hits about <b class="text-slate-200">${Math.round(fo*100)}%</b> of the time`);
-  let why = bits.join(', while ') + (bits.length ? '.' : '');
+  const pr = projectFor(id, mk.key);
+  let why = '';
+  if(pr && m) why = `${modelLine(pr, mk)}, so a <b class="text-slate-200">${Math.round(pr.p*100)}%</b> chance to clear ${m.line}${fo!=null?`, while DraftKings' price says <b class="text-slate-200">${Math.round(fo*100)}%</b>`:''}.`;
+  else if(sp.l10.n && m) why = `He cleared ${m.line} in <b class="text-slate-200">${sp.l10.hits} of his last ${sp.l10.n}</b>${fo!=null?`, while DraftKings' price says ${Math.round(fo*100)}%`:''}.`;
   if(e!=null) why += ` That's an edge of <b class="${e>0?'text-neon':'text-red-400'}">${e>0?'+':''}${Math.round(e*100)}</b>.`;
+  if(pr && sp.l10.n) why += ` Last 10: ${sp.l10.hits}/${sp.l10.n} over.`;
   if(mu?.score!=null) why += ` Matchup <b class="text-slate-200">${Math.round(mu.score*100)}/100</b>${mu.posRank?`: ${esc(p.opp)} ranks ${ord(mu.posRank)} in ${mk.label.toLowerCase()} allowed to ${PN[mu.pg]}${mu.posRank>=21?' (soft)':mu.posRank<=10?' (tough)':''}`:''}.`;
   const weak = S.sort==='edge' && (e==null || e<=0);
-  if(S.sort!=='edge' && e!=null && e<=0) why += ` <span class="text-yellow-300">Good spot on paper, but his recent numbers don't support this line yet.</span>`;
+  if(S.sort!=='edge' && e!=null && e<=0) why += ` <span class="text-yellow-300">Good spot on paper, but the model doesn't think he clears this line.</span>`;
   const head = weak
     ? `<span class="pill pill-neut">No strong Over</span><span>Nothing in ${esc(game.short)} has a positive ${mk.label} edge right now. This is the closest one, so treat it as a pass unless the agents like it.</span>`
     : `<span class="pill pill-hit">Top prop</span><span>#1 ${mk.label} Over in ${esc(game.short)}, sorted by ${SORT_LABEL[S.sort]}. Tap any player on the Prop Board to switch.</span>`;
@@ -730,8 +781,9 @@ function oddsHTML(id, p, m, sp, mk){
   if(m){
     const io = implied(m.over), iu = implied(m.under), fo = io/(io+iu), hold = io+iu-1;
     const moved = m.openLine!=null && m.openLine!==m.line;
-    const edge = sp.l10.rate!=null && sp.l10.n>=5 && custom==null ? sp.l10.rate - fo : null;
-    const lean = edge==null ? ['NOT ENOUGH DATA','pill-dim'] : edge>0.08 ? ['OVER LEAN','pill-hit'] : edge<-0.08 ? ['UNDER LEAN','pill-miss'] : ['NO EDGE','pill-neut'];
+    const pr = projectFor(id, mk.key);
+    const edge = custom==null ? (pr?.edge ?? (sp.l10.rate!=null && sp.l10.n>=5 ? sp.l10.rate - fo : null)) : null;
+    const lean = edge==null ? ['NOT ENOUGH DATA','pill-dim'] : edge>0.05 ? ['OVER VALUE','pill-hit'] : edge<-0.05 ? ['SKIP THE OVER','pill-miss'] : ['FAIR PRICE','pill-neut'];
     top = `
       <div class="mt-4 text-center">
         <div class="text-xs text-slate-500 font-mono">O/U</div>
@@ -756,7 +808,10 @@ function oddsHTML(id, p, m, sp, mk){
       <div class="mt-4 space-y-1.5 text-xs font-mono">
         <div class="flex justify-between"><span class="text-slate-500">Book hold (vig)</span><span>${pct(hold,2)}</span></div>
         <div class="flex justify-between"><span class="text-slate-500">No-vig fair Over / Under</span><span>${pct(fo)} / ${pct(1-fo)}</span></div>
-        <div class="flex justify-between"><span class="text-slate-500">L10 hit vs fair Over</span><span style="color:${edge==null?'#94a3b8':edge>=0?'#39ff88':'#f87171'}">${edge==null?'—':(edge>=0?'+':'')+(edge*100).toFixed(1)+' pts'}</span></div>
+        <div class="flex justify-between"><span class="text-slate-500">Model projection</span><span class="text-slate-200">${pr?pr.mu.toFixed(1):'—'}</span></div>
+        <div class="flex justify-between"><span class="text-slate-500">Model chance Over</span><span class="text-slate-200">${pr?pct(pr.p):'—'}</span></div>
+        <div class="flex justify-between"><span class="text-slate-500">Model edge vs fair</span><span style="color:${edge==null?'#94a3b8':edge>=0?'#39ff88':'#f87171'}">${edge==null?'—':(edge>=0?'+':'')+(edge*100).toFixed(1)+' pts'}</span></div>
+        ${pr?`<div class="text-[10px] text-slate-500 font-sans leading-relaxed pt-1">${modelLine(pr, mk)}. L10: ${sp.l10.hits}/${sp.l10.n} over.</div>`:''}
         <div class="flex justify-between items-center pt-1"><span class="text-slate-500">Signal</span><span class="pill ${lean[1]}">${lean[0]}</span></div>
         ${m.updated?`<div class="text-[10px] text-slate-600 text-right pt-1">DK updated ${fmtTime(m.updated)}</div>`:''}
       </div>`;
@@ -769,6 +824,7 @@ function oddsHTML(id, p, m, sp, mk){
       <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-400">${mk.label.toUpperCase()}</span>
     </div>
     ${top}
+    ${m ? betBoxHTML(id, p, m, mk) : ''}
     <div class="mt-5 pt-4 border-t border-slate-800">
       <div class="text-[11px] uppercase tracking-wider text-slate-500 mb-2">Test a different line</div>
       <div class="flex gap-2">
@@ -992,6 +1048,7 @@ function shootingHTML(p, sp){
 }
 
 function wireDetail(id){
+  wireBetBox(id);
   const lt = $('logToggle');
   if(lt) lt.querySelectorAll('button').forEach(b=>b.onclick=()=>{ S.logView=b.dataset.v; renderDetail(); });
   const cl = $('customLine');
@@ -1011,11 +1068,12 @@ function wireDetail(id){
 }
 
 function renderAll(){
+  MODEL_CACHE = new Map();
   // keep focus on inputs inside detail from being destroyed mid-typing
   const ae = document.activeElement?.id;
-  if(ae==='customLine' || ae==='calcOdds'){ renderBoard(); return; }
+  if(['customLine','calcOdds','betLine','betOdds','betUnits','bkRoll'].includes(ae) || document.activeElement?.closest?.('#trackerPanel input')){ renderBoard(); return; }
   autoPick();
-  renderGames(); renderTabs(); renderBoard(); renderDetail(); renderAgents(); renderMatchupBoard();
+  renderGames(); renderTabs(); renderBoard(); renderDetail(); renderAgents(); renderMatchupBoard(); renderTracker();
 }
 
 // ===== AGENT TEAM (Gemini) =====
@@ -1139,7 +1197,8 @@ function buildCandidates(gameId, maxN=25){
       // usage boost: production without a teammate who is out tonight (only counts when he has also played WITH him this season)
       let boost = 0;
       ww.forEach(x=>{ if(x.gamesWithout>=2 && x.gamesWith>=2) boost += Math.max(-0.15, Math.min(0.25, (x.avgWithout - x.avgWith)/Math.max(2, m.line))); });
-      const conf = 0.45*blend + 0.4*(mu.score ?? 0.5) + 0.15*(0.5 + boost);   // matchup-first blend
+      const pr = projectFor(id, mk.key, m.line);
+      const conf = 0.4*(pr?.p ?? blend) + 0.2*blend + 0.3*(mu.score ?? 0.5) + 0.1*(0.5 + boost);   // model + matchup first
       const v20 = G.slice(0,20).map(mk.f), a20 = avg(v20);
       const sd = Math.sqrt(avg(v20.map(x=>(x-a20)**2)));
       const fo = fairOver(m);
@@ -1163,6 +1222,7 @@ function buildCandidates(gameId, maxN=25){
         oppPace: mu.oppPace, oppPaceRank: mu.oppPaceRank, teamPaceRank: mu.teamPaceRank,
         matchupScore: mu.score==null ? null : Math.round(mu.score*100), trendScore: Math.round(blend*100),
         nbaCom: nbaSummary(p),
+        model: pr ? { projection:+pr.mu.toFixed(1), minutesProj:+pr.minProj.toFixed(1), overPct: Math.round(pr.p*100), edgePts: pr.edge!=null ? Math.round(pr.edge*100) : null, adjustments: Object.fromEntries(pr.factors.map(([n,x])=>[n, `${x>=1?'+':''}${Math.round((x-1)*100)}%`])) } : null,
         withoutTeammates: ww.map(({valsWithout, ...x})=>({ ...x, overHitsWithout: `${valsWithout.filter(v=>v>m.line).length}/${valsWithout.length}` }))
       }});
     }
@@ -1183,6 +1243,7 @@ All data is real, pulled tonight from ESPN box scores and DraftKings for ONE gam
 - oppPace / oppPaceRank and teamPaceRank: possessions per game (rank 1 = fastest). Two fast teams = more possessions = more counting stats.
 - withoutTeammates: his production THIS SEASON in games without each teammate ruled out tonight (gamesWithout, avgWithout, overHitsWithout vs gamesWith, avgWith). If gamesWith is 0 the absence is already baked into his recent numbers; if gamesWith > 0 it is a NEW absence and the usage shift matters.
 - overHits like "7/10": games he went OVER tonight's line (same line applied to past games). restDays 0 = back-to-back. spread/gameTotal hint at game script and blowout risk.
+- model: the app's projection (projected minutes x production per minute, adjusted for matchup, pace, teammates out and blowout risk). overPct = its chance the Over hits; edgePts = overPct minus DraftKings' fair price. It is the best single number here, but it can't see late news or scheme details, so adjust it for those.
 - matchupScore (0-100, higher = friendlier) and trendScore (0-100) are the app's own quick formulas; form your own view.
 - nbaCom (when present, from NBA.com): playTypes = his main play types (freqPct of his possessions, ppp = points per possession) vs the opponent's defense on that play type (oppDefPPP allowed and oppDefRank: 1 = allows the fewest points per possession, toughest; 30 = most, softest). shotZones = where he shoots (share of his shots, his FG%) vs the opponent's FG% allowed in that zone (oppZoneRank 1 = toughest, 30 = softest). tracking: rebChances = rebound opportunities per game (the volume behind rebound props), potAst = potential assists per game (passes that led to shots; far above his assists means assists should rise), touches, drives, catch-and-shoot and pull-up attempts. usagePct vs usagePctL5 shows whether his role is growing.
 - recon (when present): live notes from a web search tonight about injuries, lineups and each team's defensive scheme. Trust it for news; ignore anything it marks as not found.
@@ -1194,6 +1255,7 @@ Build every read in this order: (1) position matchup: oppPosRankVsMarket and opp
 Grade 8-10 only when the matchup actively boosts the Over (for example: his #1 play type faces a bottom-5 defense of it, or his main zone faces a soft zone defense). Grade 4 or lower when the matchup works against it, however hot he is.
 For EVERY candidate return: {"notes":[{"id":"c1","lean":"Over|Pass","grade":1-10,"keyFactor":"position|playtype|zone|tracking|pace|usage|scheme|script|rest","note":"max 25 words, cite the matchup numbers"}]}`,
   quinn: `You are Quinn, the Quant and the team's sanity check, not the driver. For each prop ask: is tonight's line inside his realistic range? Use averages vs line relative to sdL20 (volatility), minutes stability (minL5 vs minThisSeason), sample sizes, and whether the withoutTeammates numbers are a real sample or noise. When nbaCom tracking is present, use rebChances and potAst as the underlying volume: a rebound line below what his rebound chances support, or potential assists well above his assist average, is a real statistical edge; usagePctL5 above usagePct means a growing role. Flag props where the matchup story needs a level of production he rarely reaches.
+Start from model.overPct and say whether you'd move it up or down and why.
 For EVERY candidate return: {"notes":[{"id":"c1","lean":"Over|Pass","prob":0-100 (chance the Over hits),"grade":1-10,"note":"max 20 words"}]}`,
   vig: `You are Vig, the Market analyst. Judge each Over on the DraftKings market: line and price movement from open to now (movement toward the Over means money agrees), juice, no-vig fair probability vs your read, lines that look set low or high vs his averages and matchup (possible traps), and nearby alt-ladder prices.
 For EVERY candidate return: {"notes":[{"id":"c1","lean":"Over|Pass","grade":1-10,"note":"max 20 words"}]}`,
@@ -1202,6 +1264,8 @@ Pick up to ${n} OVERS most likely to hit, ranked by conviction (probability of h
 Weighting: Scout 50%, Quinn 30%, Vig 20%. Rules:
 - Every pick needs a concrete matchup or usage reason (Scout grade 6 or higher). Never pick on recent trend alone.
 - Drop any player the recon says is out, doubtful or on a minutes limit.
+- hitPct should stay within about 10 points of model.overPct unless the recon or a specific matchup reason justifies moving it; say so in "why".
+- Prefer Overs with a positive model.edgePts; an Over the model prices below DraftKings needs a strong, specific reason.
 - Overs only. Max one pick per player. Avoid stacking picks that all need the same game script. Skip juice worse than -200 unless conviction is exceptional.
 - The headline must name the same stat and line as the pick. "why" must cite the matchup numbers (position rank, play-type or zone rank, pace, with/without, scheme) and at most one trend number.
 Return: {"summary":"2 sentences on how this matchup sets up for Overs","picks":[{"id":"c1","side":"Over","conviction":1-10,"hitPct":0-100 (chance the Over hits),"agree":"3/3|2/3","keyFactor":"position|playtype|zone|tracking|pace|usage|scheme|script","headline":"max 10 words","why":"max 45 words","risks":["short risk"]}],"fades":[{"id":"cX","note":"max 15 words on why the team passed on a tempting prop"}]}`
@@ -1274,6 +1338,7 @@ async function runAgents(){
     if(!picks.length) throw new Error('Chief found no Overs worth taking in this game. Try another game or run again.');
     AG.results[gameId] = { at: Date.now(), date: S.date, gameId, game: game.short, model: AG.usedModel || AG.model, summary: chief.summary||'', picks: picks.slice(0, AG.nPicks), fades, nCands: cands.length, recon };
     lsSet('dkat-agents2-'+S.date, AG.results);
+    trLogAgentPicks(AG.results[gameId]);
   }catch(e){ AG.error = e.message || String(e); }
   AG.running = false; AG.runningGame = null; renderAgents(true);
 }
@@ -1344,7 +1409,7 @@ function renderAgents(force){
       ${p.headline?`<div class="text-sm font-semibold text-slate-200">${esc(p.headline)}</div>`:''}
       <div class="text-xs text-slate-400 leading-relaxed">${esc(p.why||'')}</div>
       ${(p.risks||[]).length?`<div class="text-[11px] text-yellow-300/80">Risk: ${esc(p.risks.join(' · '))}</div>`:''}
-      <div class="flex gap-1.5 flex-wrap mt-auto pt-1">${gradeChip(an('scout'),p.s)}${gradeChip(an('quinn'),p.q)}${gradeChip(an('vig'),p.v)}</div>
+      <div class="flex gap-1.5 flex-wrap items-center mt-auto pt-1">${gradeChip(an('scout'),p.s)}${gradeChip(an('quinn'),p.q)}${gradeChip(an('vig'),p.v)}${(()=>{ const e = trFind(R2date(gid), c.pid, c.mkey); return e?.bet ? `<span class="ml-auto text-[11px] font-semibold text-neon">✓ Bet ${e.bet.units}u</span>` : `<span data-bet="${gid}:${i}" role="button" class="ml-auto text-[11px] font-bold rounded-md px-2 py-1 bg-neon/15 text-neon border border-neon/40 hover:bg-neon/25">I bet this</span>`; })()}</div>
     </button>`;
   };
   const reports = R ? `${R.recon?`<div class="mt-4 rounded-lg border border-slate-800 bg-slate-950/50 p-3"><div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">${an('scout')}'s live recon (Google Search)</div><div class="text-xs text-slate-300 whitespace-pre-line leading-relaxed">${esc(R.recon)}</div></div>`:`<div class="mt-4 text-[11px] text-slate-500">Live recon was unavailable for this run.</div>`}<div class="mt-4 overflow-x-auto scroll-thin"><table class="w-full text-xs"><thead><tr class="text-left text-[10px] uppercase tracking-wider text-slate-500 border-b border-slate-800"><th class="py-2 pr-2">Pick</th><th class="py-2 pr-2">${an('scout')} (Matchup lead)</th><th class="py-2 pr-2">${an('quinn')} (Quant)</th><th class="py-2">${an('vig')} (Market)</th></tr></thead><tbody>
@@ -1421,7 +1486,228 @@ function renderAgents(force){
   on('agentCopy', async ()=>{
     const txt = `Agent Picks ${R.game} ${R.date}\n` + R.picks.map((p,i)=>`${i+1}. ${p.cand.player} Over ${p.cand.line} ${p.cand.market} (${fmtOdds(p.cand.overOdds)}) · conviction ${p.conviction}/10 · ${p.why||''}`).join('\n');
     try { await navigator.clipboard.writeText(txt); $('agentCopy').textContent='Copied'; } catch(e){ $('agentCopy').textContent='Copy failed'; } });
+  el.querySelectorAll('[data-bet]').forEach(b=>b.onclick=(ev)=>{ ev.stopPropagation(); const [gid, i] = b.dataset.bet.split(':'); const pk = resultFor(gid)?.picks?.[+i]; if(!pk) return;
+    trAddBet(pk.cand.pid, pk.cand.mkey, 1, pk.cand.overOdds, pk.cand.line, { date: R2date(gid), agent: pk }); renderAgents(true); });
   el.querySelectorAll('[data-pick]').forEach(b=>b.onclick=()=>{ const [gid, i] = b.dataset.pick.split(':'); const p = resultFor(gid)?.picks?.[+i]; if(!p) return; S.market = p.cand.mkey; selectPlayer(p.cand.pid); $('detail').scrollIntoView({behavior:'smooth', block:'start'}); });
+}
+
+
+// ===== PICK TRACKER (saved only in this browser; Export/Import moves it between devices) =====
+const TR = { list: lsGet('dkat-tracker') || [], bank: { bankroll: 1000, unitPct: 1, ...(lsGet('dkat-bankroll') || {}) }, tab: 'bets', open: false, grading: false, closing: null };
+const trSave = () => lsSet('dkat-tracker', TR.list);
+const trKey = (date, pid, mkey) => `${date}|${pid}|${mkey}`;
+const trFind = (date, pid, mkey) => TR.list.find(x=>x.key===trKey(date, pid, mkey));
+const R2date = gid => AG.results[gid]?.date || AG.published?.[gid]?.date || S.date;
+const unitUsd = () => TR.bank.bankroll * TR.bank.unitPct / 100;
+const decimalOf = o => o>0 ? 1 + o/100 : 1 + 100/(-o);
+const breakEven = o => implied(o);
+function trSnapshot(pid, mkey, date){
+  const p = S.players[pid] || {}, m = S.props[pid]?.markets?.[mkey] || {}, g = S.games.find(x=>x.id===p.gameId);
+  const pr = projectFor(pid, mkey, m.line);
+  return { key: trKey(date, pid, mkey), date, gameId: p.gameId, game: g?.short || '', tip: g ? g.date.toISOString() : null,
+    pid, player: p.name || pid, team: p.team, opp: p.opp, mkey, market: MK[mkey].label, line: m.line, overOdds: m.over, underOdds: m.under,
+    fairPct: fairOver(m)!=null ? Math.round(fairOver(m)*100) : null, modelPct: pr ? Math.round(pr.p*100) : null, proj: pr ? +pr.mu.toFixed(1) : null,
+    agent: null, bet: null, result: null, close: null, at: Date.now() };
+}
+function trUpsert(pid, mkey, date){
+  let e = trFind(date, pid, mkey);
+  if(!e){ e = trSnapshot(pid, mkey, date); TR.list.unshift(e); }
+  return e;
+}
+function trLogAgentPicks(res){
+  if(!res?.picks) return;
+  res.picks.forEach(pk=>{ const c = pk.cand; if(!c) return;
+    const e = trUpsert(c.pid, c.mkey, res.date);
+    e.agent = { conviction: pk.conviction, hitPct: pk.hitPct, keyFactor: pk.keyFactor || null, headline: pk.headline || '' };
+    if(e.line==null){ e.line = c.line; e.overOdds = c.overOdds; } });
+  trSave();
+}
+function trAddBet(pid, mkey, units, odds, line, opts={}){
+  const date = opts.date || S.date;
+  const e = trUpsert(pid, mkey, date);
+  if(opts.agent && !e.agent) e.agent = { conviction: opts.agent.conviction, hitPct: opts.agent.hitPct, keyFactor: opts.agent.keyFactor || null, headline: opts.agent.headline || '' };
+  e.bet = { units: +units || 1, odds: +odds || e.overOdds || -110, line: line ?? e.line, at: Date.now() };
+  e.result = null; trSave();
+}
+function trOutcome(val, line){ return val>line ? 'win' : val===line ? 'push' : 'loss'; }
+function trUnits(e){
+  if(!e.bet || !e.result || !e.bet.line && e.bet.line!==0) return 0;
+  const st = trOutcome(e.result.val, e.bet.line);
+  if(e.result.dnp || st==='push') return 0;
+  return st==='win' ? e.bet.units*(decimalOf(e.bet.odds)-1) : -e.bet.units;
+}
+async function trGradeAll(){
+  if(TR.grading) return; TR.grading = true;
+  try{
+    const today = S.date || isoDay(new Date());
+    const pending = TR.list.filter(e=>!e.result && e.gameId && (e.date < today || S.games.find(g=>g.id===e.gameId)?.status?.completed));
+    const byPid = {}; pending.forEach(e=>(byPid[e.pid] ??= []).push(e));
+    await Promise.all(Object.entries(byPid).map(([pid, es]) => limit(async ()=>{
+      const seasons = [...new Set(es.map(e=>{ const d = new Date(e.date+'T12:00:00'); return d.getMonth()>=8 ? d.getFullYear()+1 : d.getFullYear(); }))];
+      let games = [];
+      for(const sz of seasons){ try { games = games.concat(parseLog(await getJSON(`${WEB}/athletes/${pid}/gamelog?season=${sz}`), sz)); } catch(e){} }
+      es.forEach(e=>{
+        const g = games.find(x=>x.id===e.gameId);
+        if(g){ e.result = { val: MK[e.mkey].f(g), min: g.min }; }
+        else if(e.date < isoDay(new Date(Date.now()-2*86400000))) e.result = { val: null, dnp: true };  // didn't play: bet is void
+      });
+    })));
+    trSave();
+  } finally { TR.grading = false; scheduleRender(); }
+}
+async function loadClosingLines(){
+  for(const u of ['https://raw.githubusercontent.com/Nichols-projects/NBA-analytics-tool-/main/closing-lines.json', 'closing-lines.json']){
+    try { const r = await fetch(u + '?m=' + Math.floor(Date.now()/300000)); if(!r.ok) continue; const j = await r.json(); if(j?.games){ TR.closing = j; trApplyClosing(); scheduleRender(); return; } } catch(e){}
+  }
+}
+function trApplyClosing(){
+  if(!TR.closing) return; let changed = false;
+  TR.list.forEach(e=>{ const c = TR.closing.games?.[e.gameId]?.lines?.[`${e.pid}|${e.mkey}`]; if(c && !e.close){ e.close = { line:c[0], over:c[1], under:c[2] }; changed = true; } });
+  if(changed) trSave();
+}
+function trClv(e){
+  // For an Over: a lower bet line than the close, or a better price at the same line, means you beat the closing line.
+  if(!e.bet || !e.close || e.close.line==null) return null;
+  const lineDiff = e.close.line - e.bet.line;
+  let priceDiff = null;
+  if(lineDiff===0 && !isNaN(e.close.over) && !isNaN(e.close.under)){ const io = implied(e.close.over), iu = implied(e.close.under); priceDiff = io/(io+iu) - implied(e.bet.odds); }
+  return { lineDiff, priceDiff, beat: lineDiff>0 || (lineDiff===0 && priceDiff!=null && priceDiff>0) };
+}
+function kellyUnits(pModel, odds){
+  if(pModel==null || odds==null || isNaN(odds)) return null;
+  const b = decimalOf(odds)-1, f = (b*pModel - (1-pModel))/b;
+  if(f<=0) return 0;
+  return Math.min(2, Math.round((f/4) * 100 / TR.bank.unitPct * 2)/2);   // quarter-Kelly, in units, capped at 2u
+}
+
+function betBoxHTML(id, p, m, mk){
+  const e = trFind(S.date, id, mk.key);
+  const pr = projectFor(id, mk.key, m.line);
+  const ku = pr ? kellyUnits(pr.p, m.over) : null;
+  const be = breakEven(m.over);
+  if(e?.bet) return `<div class="mt-4 rounded-lg border border-neon/40 bg-neon/5 p-3 text-xs"><div class="flex items-center justify-between"><span class="font-bold text-neon">✓ Logged: Over ${e.bet.line} at ${fmtOdds(e.bet.odds)}, ${e.bet.units}u ($${(e.bet.units*unitUsd()).toFixed(0)})</span><button id="betUndo" class="text-slate-400 hover:text-white">Undo</button></div><div class="text-slate-500 mt-1">It's graded automatically after the game. See it in Tracker.</div></div>`;
+  return `<div class="mt-4 rounded-lg border border-slate-700 bg-slate-950/60 p-3">
+    <div class="flex items-center justify-between"><span class="text-[11px] uppercase tracking-wider text-slate-500">Log this Over in your tracker</span><span class="text-[10px] text-slate-500 font-mono">1u = $${unitUsd().toFixed(0)}</span></div>
+    <div class="flex flex-wrap items-end gap-2 mt-2">
+      <label class="text-[10px] text-slate-500">Units<select id="betUnits" class="block mt-1 bg-slate-900 border border-slate-700 rounded-md px-2 py-1.5 text-sm font-mono">${[0.5,1,1.5,2].map(u=>`<option ${u===1?'selected':''}>${u}</option>`).join('')}</select></label>
+      <label class="text-[10px] text-slate-500">Line<input id="betLine" type="number" step="0.5" value="${m.line}" class="block mt-1 w-20 bg-slate-900 border border-slate-700 rounded-md px-2 py-1.5 text-sm font-mono" /></label>
+      <label class="text-[10px] text-slate-500">Odds<input id="betOdds" type="number" value="${m.over}" class="block mt-1 w-20 bg-slate-900 border border-slate-700 rounded-md px-2 py-1.5 text-sm font-mono" /></label>
+      <button id="betSave" class="text-xs font-bold bg-neon text-slate-950 rounded-md px-3 py-2">I bet this</button>
+    </div>
+    <div class="text-[10px] text-slate-500 mt-2 leading-relaxed">Break-even at ${fmtOdds(m.over)}: <b class="text-slate-300">${pct(be)}</b>.${pr?` Model: ${pct(pr.p)}.`:''} ${ku==null?'':ku===0?'<span class="text-red-400">Model says no stake (no edge at this price).</span>':`Model suggests <b class="text-slate-300">${ku}u</b> (¼-Kelly, max 2u).`}</div>
+  </div>`;
+}
+function wireBetBox(id){
+  const sv = $('betSave');
+  if(sv) sv.onclick = () => { trAddBet(id, S.market, parseFloat($('betUnits').value), parseFloat($('betOdds').value), parseFloat($('betLine').value)); renderAll(); };
+  const un = $('betUndo');
+  if(un) un.onclick = () => { const e = trFind(S.date, id, S.market); if(e){ e.bet = null; if(!e.agent) TR.list = TR.list.filter(x=>x!==e); trSave(); } renderAll(); };
+}
+
+function renderTracker(){
+  const el = $('trackerPanel'), grid = $('mainGrid'), ap = $('agentPanel'), mb = $('matchupBoard');
+  $('trackerBtn').classList.toggle('active', TR.open);
+  [grid, ap, mb].forEach(x=>x && x.classList.toggle('hidden', TR.open));
+  el.classList.toggle('hidden', !TR.open);
+  if(!TR.open) return;
+  const bets = TR.list.filter(e=>e.bet);
+  const graded = bets.filter(e=>e.result && !e.result.dnp);
+  const wins = graded.filter(e=>trOutcome(e.result.val, e.bet.line)==='win').length, pushes = graded.filter(e=>trOutcome(e.result.val, e.bet.line)==='push').length, losses = graded.length - wins - pushes;
+  const units = bets.reduce((t,e)=>t+trUnits(e),0), risked = graded.filter(e=>trOutcome(e.result.val, e.bet.line)!=='push').reduce((t,e)=>t+e.bet.units,0);
+  const clvs = bets.map(trClv).filter(Boolean), beat = clvs.filter(c=>c.beat).length;
+  const avgBE = graded.length ? avg(graded.map(e=>breakEven(e.bet.odds))) : null;
+  const card = (label, val, sub, color) => `<div class="card p-4"><div class="text-[10px] uppercase tracking-wider text-slate-500">${label}</div><div class="text-2xl font-extrabold font-mono mt-1" ${color?`style="color:${color}"`:''}>${val}</div>${sub?`<div class="text-[11px] text-slate-500 mt-1">${sub}</div>`:''}</div>`;
+  const tabs = [['bets','My bets'],['agents','Agent & model accuracy'],['bank','Bankroll'],['data','Backup']];
+  const statusPill = e => { if(!e.result) return `<span class="pill pill-dim">${e.date < S.date ? 'Grading…' : 'Pending'}</span>`; if(e.result.dnp) return `<span class="pill pill-dim">Void (DNP)</span>`;
+    const st = trOutcome(e.result.val, e.bet ? e.bet.line : e.line); return `<span class="pill ${st==='win'?'pill-hit':st==='loss'?'pill-miss':'pill-neut'}">${st==='win'?'Won':st==='loss'?'Lost':'Push'} · ${e.result.val}</span>`; };
+  let body = '';
+  if(TR.tab==='bets'){
+    body = `<div class="grid grid-cols-2 lg:grid-cols-5 gap-3">
+        ${card('Record', `${wins}-${losses}${pushes?'-'+pushes:''}`, graded.length?`${pct(wins/Math.max(1,wins+losses),1)} wins · need ${avgBE?pct(avgBE,1):'—'} to break even`:'No graded bets yet')}
+        ${card('Units', `${units>=0?'+':''}${units.toFixed(2)}u`, `$${(units*unitUsd()).toFixed(0)} at $${unitUsd().toFixed(0)}/unit`, units>=0?'#39ff88':'#f87171')}
+        ${card('ROI', risked?`${(units/risked*100).toFixed(1)}%`:'—', 'Profit ÷ units risked')}
+        ${card('Beat the close', clvs.length?`${beat}/${clvs.length}`:'—', clvs.length?`${pct(beat/clvs.length,0)} of bets got a better number than the closing line`:'Shows once closing lines are recorded')}
+        ${card('Open bets', bets.filter(e=>!e.result).length, `${bets.length} logged in total`)}
+      </div>
+      <div class="card p-4 mt-4"><div class="overflow-x-auto scroll-thin"><table class="w-full text-sm">
+        <thead><tr class="text-left text-[10px] uppercase tracking-wider text-slate-500 border-b border-slate-800"><th class="py-2 pr-2">Date</th><th class="py-2 pr-2">Bet</th><th class="py-2 pr-2">Units</th><th class="py-2 pr-2">Odds</th><th class="py-2 pr-2">Model</th><th class="py-2 pr-2">Close</th><th class="py-2 pr-2">Result</th><th class="py-2 pr-2 text-right">P&L</th><th></th></tr></thead>
+        <tbody>${bets.length ? bets.map(e=>{ const c = trClv(e), u = trUnits(e);
+          return `<tr class="border-b border-slate-800/60"><td class="py-2 pr-2 font-mono text-slate-400 whitespace-nowrap">${esc(e.date.slice(5))}</td>
+            <td class="py-2 pr-2"><div class="font-semibold">${esc(e.player)}</div><div class="text-[11px] text-slate-500">Over ${e.bet.line} ${esc(e.market)} · ${esc(e.team||'')} vs ${esc(e.opp||'')}${e.agent?` · agents ${e.agent.conviction}/10`:''}</div></td>
+            <td class="py-2 pr-2"><input data-tu="${esc(e.key)}" type="number" step="0.5" min="0.5" value="${e.bet.units}" class="w-16 bg-slate-900 border border-slate-700 rounded px-1.5 py-1 font-mono text-xs" /></td>
+            <td class="py-2 pr-2"><input data-to="${esc(e.key)}" type="number" value="${e.bet.odds}" class="w-16 bg-slate-900 border border-slate-700 rounded px-1.5 py-1 font-mono text-xs" /></td>
+            <td class="py-2 pr-2 font-mono text-xs">${e.modelPct!=null?e.modelPct+'%':'—'}</td>
+            <td class="py-2 pr-2 font-mono text-xs">${c?`<span class="${c.beat?'text-neon':'text-red-400'}">${e.close.line}${c.lineDiff===0&&c.priceDiff!=null?` (${c.priceDiff>=0?'+':''}${(c.priceDiff*100).toFixed(1)}%)`:''}</span>`:'<span class="text-slate-600">—</span>'}</td>
+            <td class="py-2 pr-2">${statusPill(e)}</td>
+            <td class="py-2 pr-2 text-right font-mono ${u>0?'text-neon':u<0?'text-red-400':'text-slate-500'}">${e.result?`${u>=0?'+':''}${u.toFixed(2)}u`:'—'}</td>
+            <td class="py-2 text-right"><button data-td="${esc(e.key)}" class="text-[11px] text-slate-500 hover:text-red-400">Remove</button></td></tr>`; }).join('') : `<tr><td colspan="9" class="py-8 text-center text-slate-500 text-sm">No bets logged yet. Tap <b class="text-slate-300">I bet this</b> on an agent pick or in a player's DraftKings card.</td></tr>`}</tbody></table></div>
+        <p class="text-[10px] text-slate-500 mt-3">Bets are graded automatically from ESPN box scores the morning after. Close = DraftKings' line just before tip-off (green = you got a better number). A player who doesn't play voids the bet.</p></div>`;
+  } else if(TR.tab==='agents'){
+    const ag = TR.list.filter(e=>e.agent && e.result && !e.result.dnp);
+    const hit = e => trOutcome(e.result.val, e.line)==='win';
+    const bucket = (arr, keyFn, edges, labels, predFn) => labels.map((lab,i)=>{ const xs = arr.filter(e=>{ const v = keyFn(e); return v!=null && v>=edges[i] && v<edges[i+1]; });
+      return { lab, n: xs.length, hit: xs.length ? xs.filter(hit).length/xs.length : null, pred: xs.length ? avg(xs.map(predFn))/100 : null }; });
+    const conv = bucket(ag, e=>e.agent.conviction, [0,7,8,9,11], ['6 or lower','7','8','9–10'], e=>e.agent.hitPct ?? 50);
+    const allModel = TR.list.filter(e=>e.modelPct!=null && e.result && !e.result.dnp);
+    const mod = bucket(allModel, e=>e.modelPct, [0,45,55,65,101], ['Under 45%','45–55%','55–65%','65%+'], e=>e.modelPct);
+    const mkts = MARKETS.map(m=>{ const xs = ag.filter(e=>e.mkey===m.key); return { lab:m.label, n:xs.length, hit: xs.length ? xs.filter(hit).length/xs.length : null }; }).filter(x=>x.n);
+    const tbl = (title, rows, predLabel, note) => `<div class="card p-4"><div class="font-bold text-sm">${title}</div><table class="w-full text-sm mt-2"><thead><tr class="text-left text-[10px] uppercase tracking-wider text-slate-500 border-b border-slate-800"><th class="py-1.5">Group</th><th class="py-1.5">Picks</th><th class="py-1.5">Actually hit</th>${predLabel?`<th class="py-1.5">${predLabel}</th>`:''}</tr></thead><tbody>
+      ${rows.map(r=>`<tr class="border-b border-slate-800/60"><td class="py-1.5">${r.lab}</td><td class="py-1.5 font-mono">${r.n}</td><td class="py-1.5 font-mono ${r.hit==null?'text-slate-600':r.hit>=0.55?'text-neon':r.hit<0.5?'text-red-400':'text-yellow-300'}">${r.hit==null?'—':pct(r.hit,0)}</td>${predLabel?`<td class="py-1.5 font-mono text-slate-400">${r.pred==null?'—':pct(r.pred,0)}</td>`:''}</tr>`).join('')}</tbody></table>
+      <p class="text-[10px] text-slate-500 mt-2">${note}</p></div>`;
+    body = `<div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+      ${tbl('Agent conviction vs reality', conv, 'Agents said', 'If higher conviction doesn’t hit more often, trust the conviction score less. Needs about 30+ graded picks to mean much.')}
+      ${tbl('Model chance vs reality', mod, 'Model said', 'A well-calibrated model’s "Actually hit" lands close to "Model said" in each row.')}
+      ${tbl('Agent picks by stat', mkts.length?mkts:[{lab:'No graded agent picks yet', n:0, hit:null}], '', 'Shows which stat types the team reads best.')}
+    </div><p class="text-[11px] text-slate-500 mt-3">Every pick the agent team makes on this device is logged automatically (${TR.list.filter(e=>e.agent).length} so far, ${ag.length} graded), whether or not you bet it, so the team’s accuracy can be measured honestly.</p>`;
+  } else if(TR.tab==='bank'){
+    body = `<div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      <div class="card p-4 space-y-3"><div class="font-bold text-sm">Your bankroll</div>
+        <div class="flex flex-wrap gap-3 items-end">
+          <label class="text-xs text-slate-400">Bankroll ($)<input id="bkRoll" type="number" min="0" value="${TR.bank.bankroll}" class="block mt-1 w-32 bg-slate-900 border border-slate-700 rounded-md px-2 py-1.5 font-mono" /></label>
+          <label class="text-xs text-slate-400">1 unit = % of bankroll<select id="bkPct" class="block mt-1 bg-slate-900 border border-slate-700 rounded-md px-2 py-1.5 font-mono">${[0.5,1,1.5,2].map(v=>`<option ${v==TR.bank.unitPct?'selected':''}>${v}</option>`).join('')}</select></label>
+          <button id="bkSave" class="text-xs font-bold bg-neon text-slate-950 rounded-md px-3 py-2">Save</button>
+        </div>
+        <div class="text-sm">1 unit = <b class="font-mono text-neon">$${unitUsd().toFixed(2)}</b></div>
+        <ul class="text-xs text-slate-400 list-disc pl-4 space-y-1">
+          <li>Bet the same 1 unit on most plays. Go up to 1.5–2u only when the model's suggested stake says so.</li>
+          <li>Keep a unit at 1–2% of your bankroll, so a normal losing streak of 8–10 bets doesn't hurt.</li>
+          <li>Parlays multiply DraftKings' edge with every leg. Straight bets keep it smallest.</li>
+          <li>Set the bankroll once and adjust it monthly, not after every win or loss.</li>
+        </ul></div>
+      <div class="card p-4"><div class="font-bold text-sm">Break-even win rate by price</div>
+        <table class="w-full text-sm mt-2"><thead><tr class="text-left text-[10px] uppercase tracking-wider text-slate-500 border-b border-slate-800"><th class="py-1.5">Odds</th><th class="py-1.5">You must win</th><th class="py-1.5">$ to win on 1u</th></tr></thead><tbody>
+        ${[-150,-130,-120,-115,-110,-105,100,110,130].map(o=>`<tr class="border-b border-slate-800/60"><td class="py-1.5 font-mono">${fmtOdds(o)}</td><td class="py-1.5 font-mono">${pct(breakEven(o),1)}</td><td class="py-1.5 font-mono">$${(unitUsd()*(decimalOf(o)-1)).toFixed(2)}</td></tr>`).join('')}
+        </tbody></table><p class="text-[10px] text-slate-500 mt-2">At -110 you need 52.4% just to break even. A pick is only worth it when the model's chance is above this number.</p></div>
+    </div>`;
+  } else {
+    body = `<div class="card p-4 space-y-3 max-w-2xl"><div class="font-bold text-sm">Backup and move your tracker</div>
+      <p class="text-xs text-slate-400">Your tracker is saved only in this browser. To move it to another device, export it here and import the file on the other device. Importing combines both lists, so nothing is lost.</p>
+      <div class="flex flex-wrap gap-2"><button id="trExport" class="text-xs font-bold bg-neon text-slate-950 rounded-md px-3 py-2">Export tracker file</button>
+        <label class="text-xs font-bold border border-slate-600 hover:border-neon/60 rounded-md px-3 py-2 cursor-pointer">Import tracker file<input id="trImport" type="file" accept=".json,application/json" class="hidden" /></label></div>
+      <div id="trMsg" class="text-xs text-slate-400"></div>
+      <div class="pt-3 border-t border-slate-800"><button id="trClear" class="text-xs text-red-400 hover:text-red-300">${TR.confirmClear?'Tap again to erase everything on this device':'Erase tracker on this device'}</button></div></div>`;
+  }
+  el.innerHTML = `<div class="card p-4 sm:p-5 glow">
+    <div class="flex flex-wrap items-center gap-3">
+      <div class="w-9 h-9 rounded-lg bg-neon/15 border border-neon/40 grid place-items-center text-neon font-mono font-bold text-xs">$</div>
+      <div><h3 class="font-extrabold tracking-tight">Tracker</h3><div class="text-[11px] text-slate-500 font-mono">${bets.length} bets · ${TR.list.filter(e=>e.agent).length} agent picks · saved on this device${TR.grading?' · grading…':''}</div></div>
+      <button id="trClose" class="ml-auto text-xs border border-slate-700 hover:border-neon/60 rounded-md px-3 py-2">Back to props</button>
+    </div>
+    <div class="flex gap-1 bg-slate-900 border border-slate-800 rounded-lg p-1 mt-4 overflow-x-auto scroll-thin w-fit max-w-full">${tabs.map(([k,l])=>`<button data-trt="${k}" class="tab shrink-0 px-3 py-1.5 rounded-md text-xs font-bold ${TR.tab===k?'active':'text-slate-400 hover:text-slate-100'}">${l}</button>`).join('')}</div>
+    <div class="mt-4">${body}</div></div>`;
+  el.querySelectorAll('[data-trt]').forEach(b=>b.onclick=()=>{ TR.tab = b.dataset.trt; TR.confirmClear = false; renderTracker(); });
+  $('trClose').onclick = () => { TR.open = false; renderAll(); };
+  el.querySelectorAll('[data-tu]').forEach(i=>i.onchange=()=>{ const e = TR.list.find(x=>x.key===i.dataset.tu); if(e?.bet){ e.bet.units = Math.max(0.5, parseFloat(i.value)||1); trSave(); renderTracker(); } });
+  el.querySelectorAll('[data-to]').forEach(i=>i.onchange=()=>{ const e = TR.list.find(x=>x.key===i.dataset.to); const v = parseFloat(i.value); if(e?.bet && Math.abs(v)>=100){ e.bet.odds = v; trSave(); renderTracker(); } });
+  el.querySelectorAll('[data-td]').forEach(b=>b.onclick=()=>{ const e = TR.list.find(x=>x.key===b.dataset.td); if(e){ e.bet = null; if(!e.agent) TR.list = TR.list.filter(x=>x!==e); trSave(); renderTracker(); } });
+  const bk = $('bkSave'); if(bk) bk.onclick = () => { TR.bank.bankroll = Math.max(0, parseFloat($('bkRoll').value)||0); TR.bank.unitPct = parseFloat($('bkPct').value)||1; lsSet('dkat-bankroll', TR.bank); renderTracker(); };
+  const ex = $('trExport'); if(ex) ex.onclick = () => { const blob = new Blob([JSON.stringify({ app:'dk-analytics-terminal', exported:new Date().toISOString(), bank:TR.bank, list:TR.list })], { type:'application/json' });
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `dk-tracker-${S.date}.json`; document.body.appendChild(a); a.click(); a.remove(); $('trMsg').textContent = 'Saved to your downloads. Import it on the other device.'; };
+  const im = $('trImport'); if(im) im.onchange = async () => { try { const j = JSON.parse(await im.files[0].text()); const have = new Set(TR.list.map(e=>e.key)); let added = 0;
+      (j.list||[]).forEach(e=>{ if(e && e.key && !have.has(e.key)){ TR.list.push(e); added++; } else if(e && e.key){ const cur = TR.list.find(x=>x.key===e.key); if(cur && !cur.bet && e.bet){ cur.bet = e.bet; added++; } } });
+      if(j.bank) { TR.bank = { ...TR.bank, ...j.bank }; lsSet('dkat-bankroll', TR.bank); }
+      TR.list.sort((a,b)=>b.date.localeCompare(a.date)); trSave(); $('trMsg').textContent = `Imported ${added} entries.`; trGradeAll(); renderTracker(); } catch(e){ $('trMsg').textContent = 'That file could not be read. Make sure it is a tracker export.'; } };
+  const cl = $('trClear'); if(cl) cl.onclick = () => { if(!TR.confirmClear){ TR.confirmClear = true; renderTracker(); return; } TR.list = []; trSave(); TR.confirmClear = false; renderTracker(); };
 }
 
 // ===== MATCHUP BOARD (slate-wide view for every visitor) =====
@@ -1539,7 +1825,9 @@ $('datePick').onchange = e => { if(e.target.value){ S.date = e.target.value; loa
   try { const sv = lsGet('dkat-prefs'); if(sv?.market && MK[sv.market]) S.market = sv.market; if(sv?.sort) { S.sort = sv.sort; $('boardSort').value = sv.sort; } } catch(e){}
   window.addEventListener('beforeunload', ()=>lsSet('dkat-prefs', { market:S.market, sort:S.sort }));
   renderAll();
-  loadSlate().then(loadPublishedPicks);
+  loadSlate().then(()=>{ loadPublishedPicks(); trGradeAll(); });
+  loadClosingLines();
+  $('trackerBtn').onclick = () => { TR.open = !TR.open; if(TR.open){ trGradeAll(); loadClosingLines(); window.scrollTo({top:0, behavior:'smooth'}); } renderAll(); };
   loadNbaCom();
   setInterval(()=>{ if(!document.hidden) loadPublishedPicks(); }, 10*60*1000);
   // auto-refresh lines every 5 minutes
