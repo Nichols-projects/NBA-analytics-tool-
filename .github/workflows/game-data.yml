@@ -1,0 +1,34 @@
+name: Referee and blowout data
+
+# Builds refs.json from two seasons of ESPN box scores: referee/crew tendencies, tonight's crews
+# (assigned 9 AM Eastern), and blowout tendencies based on the margin entering the 4th quarter.
+# Runs at about 7:20 AM, 9:20 AM, 12:20 PM and 3:20 PM Arizona time. No API keys needed.
+on:
+  schedule:
+    - cron: "20 14,16,19,22 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: game-data
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build refs.json
+        run: python3 scripts/build_game_data.py
+      - name: Commit data
+        run: |
+          git config user.name "game-data-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add refs.json data/
+          git diff --cached --quiet && echo "No changes" && exit 0
+          git commit -m "Update referee and blowout data"
+          git pull --rebase origin main
+          git push
