@@ -105,7 +105,7 @@
 
   <footer class="text-center text-[11px] text-slate-600 py-6 leading-relaxed">
     Live data: ESPN public feeds (DraftKings is ESPN's odds provider). Not affiliated with DraftKings, ESPN or the NBA. Lines can move or be pulled at any time, so confirm in the DK app before betting.<br/>
-    For research and entertainment. Gambling problem? Call 1-800-GAMBLER. · <span class="font-mono">v1.9</span>
+    For research and entertainment. Gambling problem? Call 1-800-GAMBLER. · <span class="font-mono">v2.0</span>
   </footer>
 </main>
 
@@ -1026,6 +1026,17 @@ const AG = {
   nPicks: lsGet('dkat-agent-npicks-game') || 3,
   models: [], showSettings: false, running: false, steps: {}, error: null, results: {}, resultsDate: null, published: {}, publishedAt: null, publishedDate: null, runningGame: null, showReports: false, open: true
 };
+const AGENT_DEFAULT_NAMES = { scout:'Scout', quinn:'Quinn', vig:'Vig', chief:'Chief' };
+AG.names = { ...AGENT_DEFAULT_NAMES, ...(lsGet('dkat-agent-names') || {}) };
+AG.showGuide = !lsGet('dkat-guide-seen');
+const an = k => esc(AG.names[k==='recon' ? 'scout' : k] || AGENT_DEFAULT_NAMES[k==='recon' ? 'scout' : k]);
+const TEAM_GUIDE = [
+  { key:'scout', role:'Matchup lead', weight:'50% of the vote', does:'Starts every run with a live Google search on the game (injuries, lineups, minutes limits, each defense’s scheme). Then grades each Over on the matchup: what the defense allows to his position, play types and shot zones, pace, teammates out, and blowout risk.' },
+  { key:'quinn', role:'Quant', weight:'30%', does:'The numbers check. Is the line inside his realistic range? Looks at averages vs the line, game-to-game swings, minutes, and volume stats like rebound chances and potential assists.' },
+  { key:'vig',   role:'Market', weight:'20%', does:'Reads DraftKings: where the line opened and how it moved, the juice, the no-vig price, and lines that look like traps.' },
+  { key:'chief', role:'Mission Control', weight:'Final call', does:'Weighs the three reports and picks the Overs most likely to hit, ranked by conviction (1–10). Every pick needs a real matchup reason; a hot streak alone isn’t enough. Drops anyone the recon says is out or limited.' },
+];
+
 const AGENTS = [
   { key:'recon', name:'Scout', role:'Live recon' },
   { key:'quinn', name:'Quinn', role:'Quant' },
@@ -1234,11 +1245,11 @@ async function runAgents(){
     // 1) live recon via Google Search (optional: the run continues without it)
     let recon = null;
     AG.steps.recon = 'run'; renderAgents(true);
-    try { recon = await gemJSON('', RECON_PROMPT(game, new Date(game.date).toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric'})), 'Scout recon', { search:true }); AG.steps.recon = 'done'; }
+    try { recon = await gemJSON('', RECON_PROMPT(game, new Date(game.date).toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric'})), `${AG.names.scout} recon`, { search:true }); AG.steps.recon = 'done'; }
     catch(e){ if(/API key|refused the key/i.test(e.message)) throw e; AG.steps.recon = 'fail'; recon = null; }
     renderAgents(true);
     const ctx = `${game.short} Over candidates (${cands.length}):\n${data}\n\nrecon (live web search notes):\n${recon || 'unavailable tonight'}`;
-    const NAMES = { quinn:'Quinn', scout:'Scout', vig:'Vig' };
+    const NAMES = { quinn:AG.names.quinn, scout:AG.names.scout, vig:AG.names.vig };
     const reports = {};
     for(const k of ['scout','quinn','vig']){                      // one at a time, so Gemini isn't hit all at once
       await new Promise(res=>setTimeout(res, 1500));
@@ -1251,7 +1262,7 @@ async function runAgents(){
     await new Promise(res=>setTimeout(res, 1500));
     AG.steps.chief = 'run'; renderAgents(true);
     const chief = await gemJSON(AGENT_BASE+'\n\n'+AGENT_PROMPTS.chief(AG.nPicks),
-      `${ctx}\n\nScout report (lead):\n${JSON.stringify(scout)}\n\nQuinn report:\n${JSON.stringify(quinn)}\n\nVig report:\n${JSON.stringify(vig)}`, 'Chief');
+      `${ctx}\n\nScout report (lead):\n${JSON.stringify(scout)}\n\nQuinn report:\n${JSON.stringify(quinn)}\n\nVig report:\n${JSON.stringify(vig)}`, AG.names.chief);
     AG.steps.chief = 'done';
     const byId = Object.fromEntries(cands.map(c=>[c.id,c]));
     const noteMap = r => Object.fromEntries((r?.notes||[]).map(n=>[n.id,n]));
@@ -1277,7 +1288,7 @@ function renderAgents(force){
   const isPub = r => !!r && !AG.results[r.gameId] && !!AG.published?.[r.gameId];
   const R = gSel ? resultFor(gSel.id) : null;
   const allRes = S.games.map(g=>resultFor(g.id)).filter(Boolean);
-  const stepPill = k => { const st = AG.steps[k]; const a = AGENTS.find(x=>x.key===k);
+  const stepPill = k => { const st = AG.steps[k]; const a = { ...AGENTS.find(x=>x.key===k), name: an(k) };
     const cls = st==='done' ? 'pill-hit' : st==='fail' ? 'pill-miss' : st==='run' ? 'pill-neut' : 'pill-dim';
     return `<span class="pill ${cls}">${st==='run'?'<span class="spin mr-1.5" style="width:10px;height:10px"></span>':st==='done'?'✓ ':''}${a.name} · ${a.role}</span>`; };
   const settings = `
@@ -1296,8 +1307,16 @@ function renderAgents(force){
             ${[3,5,8].map(n=>`<option ${n==AG.nPicks?'selected':''}>${n}</option>`).join('')}
           </select></label>
         <button id="agentLoadModels" class="text-xs border border-slate-700 hover:border-neon/60 rounded-md px-3 py-2">Load model list</button>
-        <button id="agentSave" class="text-xs font-bold bg-neon text-slate-950 rounded-md px-4 py-2">Save</button>
       </div>
+      <div>
+        <div class="text-xs text-slate-400 mb-1">Name your agents <span class="text-slate-500">(saved only in this browser)</span></div>
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-2">
+          ${TEAM_GUIDE.map(t=>`<label class="text-[10px] uppercase tracking-wider text-slate-500">${t.role}
+            <input id="agentName-${t.key}" maxlength="18" value="${an(t.key)}" placeholder="${AGENT_DEFAULT_NAMES[t.key]}" class="mt-1 w-full bg-slate-900 border border-slate-700 rounded-md px-2 py-1.5 text-sm normal-case tracking-normal text-slate-200 outline-none focus:border-neon/60" /></label>`).join('')}
+        </div>
+      </div>
+      <div class="flex gap-2"><button id="agentSave" class="text-xs font-bold bg-neon text-slate-950 rounded-md px-4 py-2">Save</button>
+        <button id="agentNamesReset" class="text-xs text-slate-400 hover:text-white px-2">Reset names</button></div>
     </div>`;
   const matchChips = (c, kf) => {
     const chip = (t, r, good) => `<span class="text-[10px] font-mono px-1.5 py-0.5 rounded border" style="border-color:${good==null?'#334155':good?'#39ff8866':'#f8717166'};color:${good==null?'#94a3b8':good?'#39ff88':'#f87171'}">${t}</span>`;
@@ -1325,10 +1344,10 @@ function renderAgents(force){
       ${p.headline?`<div class="text-sm font-semibold text-slate-200">${esc(p.headline)}</div>`:''}
       <div class="text-xs text-slate-400 leading-relaxed">${esc(p.why||'')}</div>
       ${(p.risks||[]).length?`<div class="text-[11px] text-yellow-300/80">Risk: ${esc(p.risks.join(' · '))}</div>`:''}
-      <div class="flex gap-1.5 flex-wrap mt-auto pt-1">${gradeChip('Scout',p.s)}${gradeChip('Quinn',p.q)}${gradeChip('Vig',p.v)}</div>
+      <div class="flex gap-1.5 flex-wrap mt-auto pt-1">${gradeChip(an('scout'),p.s)}${gradeChip(an('quinn'),p.q)}${gradeChip(an('vig'),p.v)}</div>
     </button>`;
   };
-  const reports = R ? `${R.recon?`<div class="mt-4 rounded-lg border border-slate-800 bg-slate-950/50 p-3"><div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Scout's live recon (Google Search)</div><div class="text-xs text-slate-300 whitespace-pre-line leading-relaxed">${esc(R.recon)}</div></div>`:`<div class="mt-4 text-[11px] text-slate-500">Live recon was unavailable for this run.</div>`}<div class="mt-4 overflow-x-auto scroll-thin"><table class="w-full text-xs"><thead><tr class="text-left text-[10px] uppercase tracking-wider text-slate-500 border-b border-slate-800"><th class="py-2 pr-2">Pick</th><th class="py-2 pr-2">Scout (Matchup lead)</th><th class="py-2 pr-2">Quinn (Quant)</th><th class="py-2">Vig (Market)</th></tr></thead><tbody>
+  const reports = R ? `${R.recon?`<div class="mt-4 rounded-lg border border-slate-800 bg-slate-950/50 p-3"><div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">${an('scout')}'s live recon (Google Search)</div><div class="text-xs text-slate-300 whitespace-pre-line leading-relaxed">${esc(R.recon)}</div></div>`:`<div class="mt-4 text-[11px] text-slate-500">Live recon was unavailable for this run.</div>`}<div class="mt-4 overflow-x-auto scroll-thin"><table class="w-full text-xs"><thead><tr class="text-left text-[10px] uppercase tracking-wider text-slate-500 border-b border-slate-800"><th class="py-2 pr-2">Pick</th><th class="py-2 pr-2">${an('scout')} (Matchup lead)</th><th class="py-2 pr-2">${an('quinn')} (Quant)</th><th class="py-2">${an('vig')} (Market)</th></tr></thead><tbody>
       ${R.picks.map(p=>`<tr class="border-b border-slate-800/60 align-top"><td class="py-2 pr-2 font-semibold whitespace-nowrap">${esc(p.cand.player.split(' ').slice(-1)[0])} ${esc(p.side[0])} ${p.cand.line} ${esc(p.cand.market)}</td>${[p.s,p.q,p.v].map(n=>`<td class="py-2 pr-2 text-slate-400 min-w-[160px]">${n?`<b class="text-slate-300">${esc(n.lean||'')} ${n.grade??''}/10${n.prob!=null?' · '+n.prob+'%':''}${n.keyFactor?' · '+esc(n.keyFactor):''}</b> ${esc(n.note||'')}`:'—'}</td>`).join('')}</tr>`).join('')}
     </tbody></table>
     ${R.fades?.length?`<div class="mt-3 text-xs text-slate-400"><span class="font-semibold text-slate-300">Passed on:</span> ${R.fades.map(f=>`${esc(f.cand.player)} ${esc(f.cand.market)} ${f.cand.line} (${esc(f.note||'')})`).join(' · ')}</div>`:''}</div>` : '';
@@ -1345,11 +1364,28 @@ function renderAgents(force){
       </div>
       <div class="ml-auto flex flex-wrap items-center gap-2">
         ${R?`<button id="agentCopy" class="text-xs border border-slate-700 hover:border-neon/60 rounded-md px-3 py-2">Copy picks</button>`:''}
+        <button id="agentGuide" class="text-xs border border-slate-700 hover:border-neon/60 rounded-md px-3 py-2">${AG.showGuide?'Hide team info':'Meet the team'}</button>
         <button id="agentGear" class="text-xs border border-slate-700 hover:border-neon/60 rounded-md px-3 py-2">Settings</button>
         ${gameMenu}
         <button id="agentRun" ${canRun?'':'disabled'} class="text-sm font-bold rounded-md px-4 py-2 whitespace-nowrap ${canRun?'bg-neon text-slate-950 hover:brightness-110':'bg-slate-800 text-slate-500'}">${runLabel}</button>
       </div>
     </div>
+    ${AG.showGuide ? `<div class="mt-4 rounded-xl border border-sky-400/30 bg-sky-400/5 p-4">
+        <div class="flex items-start justify-between gap-3"><div><div class="font-bold text-sm">Meet the agent team</div>
+          <p class="text-xs text-slate-400 mt-1 max-w-3xl">Four AI analysts break down one game at a time and hand you the Overs most likely to hit. Pick a game, tap <b class="text-slate-200">Run</b>, and about 1–2 minutes later you get ranked picks with the reasons and risks. You make the final call.</p></div>
+          <button id="agentGuideClose" class="text-xs font-bold bg-neon text-slate-950 rounded-md px-3 py-1.5 shrink-0">Got it</button></div>
+        <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3 mt-3">
+          ${TEAM_GUIDE.map((t,i)=>`<div class="rounded-lg border border-slate-700 bg-slate-900/60 p-3 min-w-0">
+            <div class="flex items-center justify-between gap-2"><span class="font-extrabold">${an(t.key)}</span><span class="text-[10px] font-mono text-slate-500">${i+1} of 4</span></div>
+            <div class="text-[11px] text-sky-300 font-semibold">${t.role} · ${t.weight}</div>
+            <p class="text-xs text-slate-400 mt-1.5 leading-relaxed">${t.does}</p></div>`).join('')}
+        </div>
+        <ul class="mt-3 text-[11px] text-slate-400 space-y-1 list-disc pl-4">
+          <li><b class="text-slate-300">Overs only.</b> Picks are ranked by how confident the team is that the Over hits, not by payout.</li>
+          <li><b class="text-slate-300">Needs a free Gemini key</b> (Settings). It’s saved only in your browser, and each run uses 5 of your free requests.</li>
+          <li><b class="text-slate-300">Games that have tipped off can’t be run.</b> DraftKings pulls the props at tip, so run in the afternoon.</li>
+          <li>Rename the agents in <b class="text-slate-300">Settings</b> if you like. Research tool, not a guarantee.</li>
+        </ul></div>` : ''}
     ${AG.running || (Object.keys(AG.steps).length && !R && AG.lastGame===S.gameFilter) ? `<div class="flex flex-wrap gap-2 mt-4">${['recon','scout','quinn','vig','chief'].map(stepPill).join('')}</div>` : ''}
     ${AG.running && AG.status?`<div class="mt-3 text-xs font-mono text-slate-400">${esc(AG.status)}</div>`:''}
     ${AG.error?`<div class="mt-3 text-sm text-red-400">${esc(AG.error)}</div>`:''}
@@ -1372,8 +1408,12 @@ function renderAgents(force){
   const gm = $('agentGame'); if(gm) gm.onchange = () => { AG.error = null; setGame(gm.value); };
   el.querySelectorAll('[data-rg]').forEach(b=>b.onclick=()=>setGame(b.dataset.rg));
   on('agentGear', ()=>{ AG.showSettings = !AG.showSettings; renderAgents(true); });
+  on('agentGuide', ()=>{ AG.showGuide = !AG.showGuide; if(!AG.showGuide) lsSet('dkat-guide-seen', true); renderAgents(true); });
+  on('agentGuideClose', ()=>{ AG.showGuide = false; lsSet('dkat-guide-seen', true); renderAgents(true); });
+  on('agentNamesReset', ()=>{ AG.names = { ...AGENT_DEFAULT_NAMES }; lsSet('dkat-agent-names', AG.names); renderAgents(true); });
   on('agentReports', ()=>{ AG.showReports = !AG.showReports; renderAgents(true); });
   on('agentSave', ()=>{ AG.key = $('agentKey').value.trim(); AG.model = $('agentModel').value; AG.nPicks = +$('agentN').value || 3;
+    TEAM_GUIDE.forEach(t=>{ const v = ($('agentName-'+t.key)?.value||'').trim().slice(0,18); AG.names[t.key] = v || AGENT_DEFAULT_NAMES[t.key]; }); lsSet('dkat-agent-names', AG.names);
     lsSet('dkat-gemini-key', AG.key); lsSet('dkat-gemini-model', AG.model); lsSet('dkat-agent-npicks-game', AG.nPicks);
     AG.showSettings = false; AG.error = null; renderAgents(true); });
   on('agentLoadModels', async ()=>{ const k = $('agentKey').value.trim(); if(!k){ AG.error='Paste your Gemini key first.'; renderAgents(true); return; }
