@@ -107,7 +107,7 @@
 
   <footer class="text-center text-[11px] text-slate-600 py-6 leading-relaxed">
     Live data: ESPN public feeds (DraftKings is ESPN's odds provider). Not affiliated with DraftKings, ESPN or the NBA. Lines can move or be pulled at any time, so confirm in the DK app before betting.<br/>
-    For research and entertainment. Gambling problem? Call 1-800-GAMBLER. · <span class="font-mono">v2.4</span>
+    For research and entertainment. Gambling problem? Call 1-800-GAMBLER. · <span class="font-mono">v2.5</span>
   </footer>
 </main>
 
@@ -1213,16 +1213,18 @@ async function gemList(){
     .map(m => m.name.replace('models/',''))
     .filter(n => /gemini/.test(n) && !/(image|tts|audio|live|embed|vision|learnlm|robotics|computer)/.test(n));
 }
-function pickDefaultModel(list){
-  // Prefer stable Flash models; preview/experimental models are often overloaded on the free tier.
-  const score = n => { const v = parseFloat((n.match(/gemini-(\d+(\.\d+)?)/)||[])[1]||0);
-    return v*100 + (/flash/.test(n)?20:0) - (/lite/.test(n)?15:0) - (/(preview|exp)/.test(n)?400:0) - (/-\d{3}$|-\d{2}-\d{2}/.test(n)?2:0); };
-  return [...list].sort((a,b)=>score(b)-score(a))[0] || 'gemini-2.5-flash';
+// Rank the models your key can actually use: newest stable Flash first, then Flash-Lite, then the "latest" aliases.
+function modelScore(n){
+  const v = parseFloat((n.match(/gemini-(\d+(\.\d+)?)/)||[])[1]||0);
+  return (v ? v*100 : 150) + (/flash/.test(n)?20:0) - (/lite/.test(n)?15:0) - (/(preview|exp)/.test(n)?400:0) - (/-\d{3}$|-\d{2}-\d{2}/.test(n)?2:0) - (/pro/.test(n)?30:0);
 }
+function rankedModels(list){ return [...(list||[])].sort((a,b)=>modelScore(b)-modelScore(a)); }
+function pickDefaultModel(list){ return rankedModels(list)[0] || 'gemini-flash-latest'; }
 function modelChain(bad){
-  const backups = ['gemini-2.5-flash','gemini-2.5-flash-lite','gemini-2.0-flash','gemini-flash-latest','gemini-flash-lite-latest'];
-  const avail = AG.models && AG.models.length ? new Set(AG.models) : null;
-  const all = [...new Set([AG.usedModel, AG.model, ...backups].filter(m => m && (!avail || avail.has(m) || m===AG.model)))];
+  // Backups come from Google's live model list for this key (old model names get retired); fixed names only if that list can't load.
+  const avail = AG.models && AG.models.length ? AG.models : null;
+  const backups = avail ? rankedModels(avail).filter(m=>/flash/.test(m)).slice(0, 4) : ['gemini-flash-latest', 'gemini-flash-lite-latest'];
+  const all = [...new Set([AG.usedModel, AG.model, ...backups].filter(m => m && (!avail || avail.includes(m))))];
   const ok = all.filter(m => !bad || !bad.has(m));
   return ok.length ? ok : all;   // never come back empty: if everything was marked unavailable, try them all once more
 }
@@ -1240,13 +1242,15 @@ async function gemErr(r, model){
 async function gemJSON(system, user, who, opts={}){
   // Exponential backoff per model (2s, 5s, 12s), then fall back to the next model.
   const wait = ms => new Promise(res=>setTimeout(res, ms));
-  const delays = [2000, 5000, 12000];
+  const delays = [3000, 8000];      // two retries per model, then move on
   let lastErr = null;
   // The live search step keeps its own "unavailable" list, so a search-quota problem never blocks the agents themselves.
   const bad = opts.search ? (AG.badSearch ||= new Set()) : (AG.badModels ||= new Set());
   const chain = opts.search ? modelChain(bad).slice(0, 2) : modelChain(bad);
   for(const model of chain){
     for(let t=0; t<=delays.length; t++){
+      if(AG.cancel) throw new Error('Run stopped.');
+      if(AG.deadline && Date.now() > AG.deadline) throw new Error('Gemini is too busy right now (no usable answer in 4 minutes). Try again in a bit, or pick a different model in Settings.');
       AG.status = `${who||'Agent'} asking ${model}${t?` (retry ${t})`:''}…`; renderAgents(true);
       let r;
       try {
@@ -1408,7 +1412,10 @@ async function runAgents(){
   if(!AG.key){ AG.showSettings = true; AG.error = 'Add your free Gemini API key first.'; renderAgents(true); return; }
   AG.running = true; AG.runningGame = gameId; AG.lastGame = gameId; AG.error = null; AG.reconNote = null; AG.badSearch = new Set(); delete AG.results[gameId]; AG.usedModel = null; AG.badModels = new Set(); AG.steps = { prep:'run' }; renderAgents(true);
   try{
-    if(!AG.model){ try { AG.models = await gemList(); } catch(e){} AG.model = pickDefaultModel(AG.models); }
+    AG.deadline = Date.now() + 4*60*1000; AG.cancel = false;
+    try { AG.models = await gemList(); } catch(e){ if(/API key|refused the key/i.test(e.message)) throw e; }
+    if(AG.models?.length && AG.model && !AG.models.includes(AG.model)){ AG.model = ''; lsSet('dkat-gemini-model', ''); }
+    if(!AG.model) AG.model = pickDefaultModel(AG.models);
     await Promise.all(Object.keys(S.props).map(id=>loadLog(id)));
     if(!S.defense) await new Promise(res=>{ const t=setInterval(()=>{ if(S.defense){ clearInterval(t); res(); } }, 500); setTimeout(()=>{ clearInterval(t); res(); }, 20000); });
     if(BOX.status!=='ready') await new Promise(res=>{ const t=setInterval(()=>{ AG.status = `Loading this season's box scores for matchup data (${BOX.done}/${BOX.total})…`; renderAgents(true); if(BOX.status==='ready'){ clearInterval(t); res(); } }, 1000); setTimeout(()=>{ clearInterval(t); res(); }, 150000); });
@@ -1477,8 +1484,8 @@ function renderAgents(force){
       <div class="flex flex-wrap gap-3 items-end">
         <label class="text-xs text-slate-400">Model
           <select id="agentModel" class="mt-1 block bg-slate-900 border border-slate-700 rounded-md px-2 py-2 text-sm min-w-[200px]">
-            <option value="">Auto (best Flash model)</option>
-            ${[...new Set([...(AG.models||[]), AG.model].filter(Boolean))].map(m=>`<option value="${esc(m)}" ${m===AG.model?'selected':''}>${esc(m)}</option>`).join('')}
+            <option value="">Auto (newest Flash model for your key)</option>
+            ${[...new Set([...rankedModels(AG.models), AG.model].filter(Boolean))].map(m=>`<option value="${esc(m)}" ${m===AG.model?'selected':''}>${esc(m)}</option>`).join('')}
           </select></label>
         <label class="text-xs text-slate-400">Picks per game
           <select id="agentN" class="mt-1 block bg-slate-900 border border-slate-700 rounded-md px-2 py-2 text-sm">
@@ -1545,6 +1552,7 @@ function renderAgents(force){
         <button id="agentGuide" class="text-xs border border-slate-700 hover:border-neon/60 rounded-md px-3 py-2">${AG.showGuide?'Hide team info':'Meet the team'}</button>
         <button id="agentGear" class="text-xs border border-slate-700 hover:border-neon/60 rounded-md px-3 py-2">Settings</button>
         ${gameMenu}
+        ${AG.running?`<button id="agentStop" class="text-xs border border-red-500/50 text-red-300 hover:bg-red-500/10 rounded-md px-3 py-2">Stop</button>`:''}
         <button id="agentRun" ${canRun?'':'disabled'} class="text-sm font-bold rounded-md px-4 py-2 whitespace-nowrap ${canRun?'bg-neon text-slate-950 hover:brightness-110':'bg-slate-800 text-slate-500'}">${runLabel}</button>
       </div>
     </div>
@@ -1583,6 +1591,7 @@ function renderAgents(force){
   `;
   // wire
   const on = (id, f) => { const b = $(id); if(b) b.onclick = f; };
+  on('agentStop', ()=>{ AG.cancel = true; AG.status = 'Stopping…'; renderAgents(true); });
   on('agentRun', ()=>{ if(!AG.key){ AG.showSettings = true; AG.error = 'Add your free Gemini API key to run the team yourself.'; renderAgents(true); return; } runAgents(); });
   const gm = $('agentGame'); if(gm) gm.onchange = () => { AG.error = null; setGame(gm.value); };
   el.querySelectorAll('[data-rg]').forEach(b=>b.onclick=()=>setGame(b.dataset.rg));
