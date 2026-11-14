@@ -1,9 +1,9 @@
 name: Daily agent picks
 
+# Manual only: Tyler runs the agent team from the site with his own key instead of
+# storing it on GitHub. To turn daily publishing back on, add a GEMINI_API_KEY secret
+# and restore the schedule (10:37 AM and 3:17 PM Arizona time).
 on:
-  schedule:
-    - cron: "37 17 * * *"     # about 10:37 AM Arizona time
-    - cron: "17 22 * * *"     # about 3:17 PM Arizona time, before the first tips
   workflow_dispatch:           # "Run workflow" button on the Actions tab
 
 permissions:
