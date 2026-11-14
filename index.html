@@ -107,7 +107,7 @@
 
   <footer class="text-center text-[11px] text-slate-600 py-6 leading-relaxed">
     Live data: ESPN public feeds (DraftKings is ESPN's odds provider). Not affiliated with DraftKings, ESPN or the NBA. Lines can move or be pulled at any time, so confirm in the DK app before betting.<br/>
-    For research and entertainment. Gambling problem? Call 1-800-GAMBLER. · <span class="font-mono">v2.2</span>
+    For research and entertainment. Gambling problem? Call 1-800-GAMBLER. · <span class="font-mono">v2.3</span>
   </footer>
 </main>
 
@@ -1124,9 +1124,9 @@ function shootingHTML(p, sp){
     const trend = l10pct!=null && basePct!=null ? l10pct-basePct : null;
     return `<div class="rounded-xl border bg-slate-900/60 p-4" style="border-color:${rankColor(r)}55">
       <div class="flex items-start justify-between gap-2"><div class="text-sm font-semibold">${title}</div>${r?`<span class="pill ${rankClass(r)}">#${r}</span>`:''}</div>
-      <div class="text-2xl font-extrabold font-mono mt-2">${l10line}</div>
-      <div class="flex justify-between text-[11px] font-mono text-slate-400 mt-1"><span>L10 ${l10pct==null?'':pct(l10pct)}</span>
-        <span class="${trend==null?'':trend>=0?'text-neon':'text-red-400'}">${trend==null?'':(trend>=0?'▲':'▼')+' vs '+(base===SZ?'season':'L30')}</span></div>
+      <div class="text-2xl font-extrabold font-mono mt-2">${l10pct==null?'—':pct(l10pct)}</div>
+      <div class="text-[11px] text-slate-400 mt-0.5"><b class="font-mono text-slate-200">${l10line[0]}</b> made of <b class="font-mono text-slate-200">${l10line[1]}</b> attempts per game (last 10)</div>
+      <div class="text-[11px] font-mono mt-1 ${trend==null?'text-slate-500':trend>=0?'text-neon':'text-red-400'}">${trend==null?'':Math.abs(trend)<0.0005?`same as ${base===SZ?'season':'L30'} (${pct(basePct)})`:`${trend>=0?'▲':'▼'} ${Math.abs(trend*100).toFixed(1)} pts vs ${base===SZ?'season':'L30'} (${pct(basePct)})`}</div>
       <div class="text-[11px] mt-1" style="color:${rankColor(r)}">${r?`${esc(p.opp)} ${rankTxt}: ${rankLabel(r)}`:''}</div>
     </div>`;
   };
@@ -1134,11 +1134,11 @@ function shootingHTML(p, sp){
   const ratio = (a,m,t)=> sum(a,t) ? sum(a,m)/sum(a,t) : null;
   const minL10 = avg(L10.map(g=>g.min)), minBase = avg(base.map(g=>g.min));
   return `<h3 class="font-bold text-sm uppercase tracking-wider text-slate-400 mb-1">Shooting & Usage vs ${esc(p.opp)}</h3>
-    <p class="text-[11px] text-slate-500 mb-3">His recent shooting (per game) against what ${esc(p.opp)} allows. Badge = ${esc(p.opp)}'s defensive rank.</p>
+    <p class="text-[11px] text-slate-500 mb-3">His shooting percentage over the last 10 games, with makes and attempts per game, against what ${esc(p.opp)} allows. Badge = ${esc(p.opp)}'s defensive rank (30 = softest).</p>
     <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
-      ${tile('Field Goals', `${per(L10,'fgm')}-${per(L10,'fga')}`, ratio(L10,'fgm','fga'), ratio(base,'fgm','fga'), 'fgPct', 'FG% allowed')}
-      ${tile('Three-Pointers', `${per(L10,'fg3')}-${per(L10,'fg3a')}`, ratio(L10,'fg3','fg3a'), ratio(base,'fg3','fg3a'), 'fg3a', '3PA allowed')}
-      ${tile('Free Throws', `${per(L10,'ftm')}-${per(L10,'fta')}`, ratio(L10,'ftm','fta'), ratio(base,'ftm','fta'), null, '')}
+      ${tile('Field Goals', [per(L10,'fgm'), per(L10,'fga')], ratio(L10,'fgm','fga'), ratio(base,'fgm','fga'), 'fgPct', 'FG% allowed')}
+      ${tile('Three-Pointers', [per(L10,'fg3'), per(L10,'fg3a')], ratio(L10,'fg3','fg3a'), ratio(base,'fg3','fg3a'), 'fg3a', '3PA allowed')}
+      ${tile('Free Throws', [per(L10,'ftm'), per(L10,'fta')], ratio(L10,'ftm','fta'), ratio(base,'ftm','fta'), null, '')}
       <div class="rounded-xl border border-slate-700 bg-slate-900/60 p-4">
         <div class="text-sm font-semibold">Minutes</div>
         <div class="text-2xl font-extrabold font-mono mt-2">${minL10.toFixed(1)}</div>
