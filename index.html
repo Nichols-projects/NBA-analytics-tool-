@@ -76,7 +76,8 @@
         <div class="flex items-center justify-between mb-3 gap-2">
           <h3 class="font-bold text-sm uppercase tracking-wider text-slate-400">Prop Board <span id="boardCount" class="text-slate-600 normal-case tracking-normal font-mono"></span></h3>
           <select id="boardSort" class="bg-slate-900 border border-slate-700 rounded-md text-xs px-2 py-1 outline-none">
-            <option value="edge">Sort: Edge vs price</option>
+            <option value="edge">Sort: Best Over edge</option>
+            <option value="matchup">Sort: Best matchup</option>
             <option value="l10">Sort: L10 hit %</option>
             <option value="season">Sort: Season hit %</option>
             <option value="line">Sort: Line</option>
@@ -92,7 +93,7 @@
             <tbody id="boardBody"></tbody>
           </table>
         </div>
-        <p class="text-[10px] text-slate-500 mt-3 leading-relaxed">Hit % = how often he cleared <b>tonight's</b> DK line in past games. Edge = L10 hit % minus DK's no-vig Over probability. Green = leans Over, red = leans Under.</p>
+        <p class="text-[10px] text-slate-500 mt-3 leading-relaxed">Hit % = how often he cleared <b>tonight's</b> DK line in past games. Edge = how much more often he went Over in his last 10 than DraftKings' price implies. Positive (green) = the Over looks underpriced; negative (red) = the Over is overpriced, so skip it.</p>
       </div>
     </aside>
 
@@ -104,7 +105,7 @@
 
   <footer class="text-center text-[11px] text-slate-600 py-6 leading-relaxed">
     Live data: ESPN public feeds (DraftKings is ESPN's odds provider). Not affiliated with DraftKings, ESPN or the NBA. Lines can move or be pulled at any time, so confirm in the DK app before betting.<br/>
-    For research and entertainment. Gambling problem? Call 1-800-GAMBLER. · <span class="font-mono">v1.8</span>
+    For research and entertainment. Gambling problem? Call 1-800-GAMBLER. · <span class="font-mono">v1.9</span>
   </footer>
 </main>
 
@@ -537,7 +538,8 @@ function boardRows(){
     const sp = splits(id, S.market);
     rows.push({ id, m, sp, edge: edgeFor(id, S.market), p: S.players[id] });
   }
-  const key = { edge: r => r.edge==null ? -9 : Math.abs(r.edge), l10: r => r.sp.l10.rate ?? -1, season: r => r.sp.season.rate ?? -1, line: r => r.m.line }[S.sort];
+  const mscore = r => (BOX.status==='ready' && r.p) ? (matchupFor(r.p, S.market).score ?? -1) : -1;
+  const key = { edge: r => r.edge==null ? -9 : r.edge, matchup: mscore, l10: r => r.sp.l10.rate ?? -1, season: r => r.sp.season.rate ?? -1, line: r => r.m.line }[S.sort];
   rows.sort((a,b)=> key(b)-key(a));
   return rows;
 }
@@ -588,7 +590,7 @@ function autoPick(){
   const nid = top ? top.id : null;
   if(nid!==S.playerId){ S.playerId = nid; if(nid) loadLog(nid, true); }
 }
-const SORT_LABEL = { edge:'edge vs price', l10:'L10 hit %', season:'season hit %', line:'line' };
+const SORT_LABEL = { edge:'best Over edge', matchup:'best matchup', l10:'L10 hit %', season:'season hit %', line:'line' };
 
 function topPropsHTML(){
   const mk = MK[S.market];
@@ -617,6 +619,25 @@ function topPropsHTML(){
     <p class="text-[10px] text-slate-500 mt-3">Matchup = 0–100 blend of defense vs his position, team defense and pace (higher is friendlier). Edge = L10 hit rate minus DraftKings' no-vig Over chance.</p></div>`;
 }
 
+// Plain-language "why is this #1" for the auto-picked Top prop
+function topPropNote(id, p, game, mk, m, sp){
+  const fo = fairOver(m), e = edgeFor(id, mk.key);
+  const mu = BOX.status==='ready' ? matchupFor(p, mk.key) : null;
+  const PN = { G:'guards', F:'forwards', C:'centers' };
+  const bits = [];
+  if(sp.l10.n && m) bits.push(`He cleared ${m.line} in <b class="text-slate-200">${sp.l10.hits} of his last ${sp.l10.n}</b> (${Math.round(sp.l10.rate*100)}%)`);
+  if(fo!=null) bits.push(`DraftKings' price says the Over hits about <b class="text-slate-200">${Math.round(fo*100)}%</b> of the time`);
+  let why = bits.join(', while ') + (bits.length ? '.' : '');
+  if(e!=null) why += ` That's an edge of <b class="${e>0?'text-neon':'text-red-400'}">${e>0?'+':''}${Math.round(e*100)}</b>.`;
+  if(mu?.score!=null) why += ` Matchup <b class="text-slate-200">${Math.round(mu.score*100)}/100</b>${mu.posRank?`: ${esc(p.opp)} ranks ${ord(mu.posRank)} in ${mk.label.toLowerCase()} allowed to ${PN[mu.pg]}${mu.posRank>=21?' (soft)':mu.posRank<=10?' (tough)':''}`:''}.`;
+  const weak = S.sort==='edge' && (e==null || e<=0);
+  if(S.sort!=='edge' && e!=null && e<=0) why += ` <span class="text-yellow-300">Good spot on paper, but his recent numbers don't support this line yet.</span>`;
+  const head = weak
+    ? `<span class="pill pill-neut">No strong Over</span><span>Nothing in ${esc(game.short)} has a positive ${mk.label} edge right now. This is the closest one, so treat it as a pass unless the agents like it.</span>`
+    : `<span class="pill pill-hit">Top prop</span><span>#1 ${mk.label} Over in ${esc(game.short)}, sorted by ${SORT_LABEL[S.sort]}. Tap any player on the Prop Board to switch.</span>`;
+  return `<div class="card px-4 py-3 text-xs text-slate-400 space-y-1.5"><div class="flex flex-wrap items-center gap-2">${head}</div>${why?`<div><span class="text-slate-500 font-semibold">Why #1:</span> ${why}</div>`:''}</div>`;
+}
+
 function selectPlayer(id, scroll=true, explicit=true){
   S.playerId = id; S.userPicked = explicit;
   loadLog(id, true);
@@ -640,7 +661,7 @@ function renderDetail(){
   const sp = splits(id, S.market);
   const loading = !L || L.status!=='ok';
 
-  const autoNote = !S.userPicked && game ? `<div class="flex flex-wrap items-center gap-2 text-xs text-slate-400 -mb-2"><span class="pill pill-hit">Top prop</span><span>#1 ${mk.label} prop in ${esc(game.short)} by ${SORT_LABEL[S.sort]}. Tap any player on the Prop Board to switch.</span></div>` : '';
+  const autoNote = !S.userPicked && game ? topPropNote(id, p, game, mk, m, sp) : '';
   el.innerHTML = `
     ${autoNote}
     ${heroHTML(p, game, sp, mk)}
