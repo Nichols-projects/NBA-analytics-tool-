@@ -104,7 +104,7 @@
 
   <footer class="text-center text-[11px] text-slate-600 py-6 leading-relaxed">
     Live data: ESPN public feeds (DraftKings is ESPN's odds provider). Not affiliated with DraftKings, ESPN or the NBA. Lines can move or be pulled at any time, so confirm in the DK app before betting.<br/>
-    For research and entertainment. Gambling problem? Call 1-800-GAMBLER. · <span class="font-mono">v1.7</span>
+    For research and entertainment. Gambling problem? Call 1-800-GAMBLER. · <span class="font-mono">v1.8</span>
   </footer>
 </main>
 
@@ -172,7 +172,7 @@ document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) schedul
 // ===== DATA: SLATE, ROSTERS, PROPS =====
 async function loadSlate(){
   S.loadingSlate = true;
-  S.games = []; S.players = {}; S.props = {}; S.playerId = null; S.gameFilter = 'all';
+  S.games = []; S.players = {}; S.props = {}; S.playerId = null; S.userPicked = false; S.gameFilter = 'all';
   setStatus('loading', 'Loading slate…');
   renderAll();
   let sb;
@@ -193,7 +193,6 @@ async function loadSlate(){
   setStatus('ok');
   // queue game logs for every player with a prop
   Object.keys(S.props).forEach(id => loadLog(id));
-  if(!S.playerId){ const first = boardRows()[0]; if(first) selectPlayer(first.id, false); }
   renderAll();
 }
 
@@ -522,7 +521,7 @@ function renderGames(){
     h += chip(g.id, `${esc(g.away.abbr)} @ ${esc(g.home.abbr)} <span class="opacity-60 font-mono">· ${st}${g.spread?' · '+esc(g.spread):''}${g.total?' · O/U '+g.total:''}</span>${props}`, S.gameFilter===g.id);
   });
   $('gameChips').innerHTML = h;
-  $('gameChips').querySelectorAll('button').forEach(b=>b.onclick=()=>{ S.gameFilter=b.dataset.g; renderAll(); });
+  $('gameChips').querySelectorAll('button').forEach(b=>b.onclick=()=>setGame(b.dataset.g));
 }
 
 function renderTabs(){
@@ -575,8 +574,51 @@ function renderBoard(){
   $('boardBody').querySelectorAll('tr[data-id]').forEach(tr=>tr.onclick=()=>selectPlayer(tr.dataset.id));
 }
 
-function selectPlayer(id, scroll=true){
-  S.playerId = id;
+// Picking a game shows that game's #1 prop (by the board's sort) until you tap a player yourself.
+function setGame(g){
+  S.gameFilter = g;
+  const p = S.players[S.playerId];
+  if(g==='all'){ if(!S.userPicked) S.playerId = null; }
+  else if(!p || p.gameId!==g){ S.userPicked = false; S.playerId = null; }
+  renderAll();
+}
+function autoPick(){
+  if(S.userPicked || S.gameFilter==='all') return;
+  const top = boardRows().find(r=>S.logs[r.id]?.status==='ok') || boardRows()[0];
+  const nid = top ? top.id : null;
+  if(nid!==S.playerId){ S.playerId = nid; if(nid) loadLog(nid, true); }
+}
+const SORT_LABEL = { edge:'edge vs price', l10:'L10 hit %', season:'season hit %', line:'line' };
+
+function topPropsHTML(){
+  const mk = MK[S.market];
+  const rows = boardRows().filter(r=>S.logs[r.id]?.status==='ok').slice(0,15);
+  const head = `<div class="flex flex-wrap items-end justify-between gap-2 mb-3"><div><h3 class="font-extrabold tracking-tight text-lg">Top ${mk.label} props tonight</h3>
+    <p class="text-xs text-slate-500 mt-0.5">Every game, sorted by ${SORT_LABEL[S.sort]}. Pick a game at the top to focus on one matchup, or tap a player for the full breakdown.</p></div></div>`;
+  if(!rows.length) return `<div class="card p-5">${head}<div class="py-8 text-center text-slate-500 text-sm">${Object.keys(S.props).length ? '<span class="spin"></span><div class="mt-2 text-xs">Loading game logs…</div>' : `No DraftKings ${mk.label} props posted yet.`}</div></div>`;
+  const pct = r => r.rate==null ? '<span class="text-slate-600">—</span>' : `<span class="${r.rate>=0.6?'text-neon':r.rate<=0.4?'text-red-400':'text-yellow-300'} font-semibold">${Math.round(r.rate*100)}%</span>`;
+  const body = rows.map((r,i)=>{
+    const p = r.p || { name:'Player '+r.id, team:'', opp:'' };
+    const g = S.games.find(x=>x.id===p.gameId);
+    const mu = BOX.status==='ready' && r.p ? matchupFor(r.p, S.market) : null;
+    const e = r.edge, ec = e==null ? 'pill-dim' : e>0.08 ? 'pill-hit' : e<-0.08 ? 'pill-miss' : 'pill-neut';
+    return `<tr data-tp="${r.id}" class="border-b border-slate-800/60 cursor-pointer hover:bg-slate-800/40">
+      <td class="py-2.5 pr-2 font-mono text-slate-500">${i+1}</td>
+      <td class="py-2.5 pr-3"><div class="font-semibold">${esc(p.name)}${p.injury?` <span class="text-[10px] text-yellow-300">${esc(p.injury)}</span>`:''}</div><div class="text-[11px] font-mono text-slate-500">${esc(p.team)} ${p.home?'vs':'@'} ${esc(p.opp)}${g?' · '+(g.status.state && g.status.state!=='pre' ? 'started' : fmtTime(g.date)):''}</div></td>
+      <td class="py-2.5 pr-3 font-mono"><b>${r.m.line}</b> <span class="text-[11px] text-slate-500">${fmtOdds(r.m.over)}/${fmtOdds(r.m.under)}</span></td>
+      <td class="py-2.5 pr-3 font-mono text-center">${pct(r.sp.l10)}</td>
+      <td class="py-2.5 pr-3 font-mono text-center hidden sm:table-cell">${pct(r.sp.season)}</td>
+      <td class="py-2.5 pr-3 font-mono text-center hidden sm:table-cell">${mu?.score!=null ? `<span class="${mu.score>=0.6?'text-neon':mu.score<=0.4?'text-red-400':'text-yellow-300'}">${Math.round(mu.score*100)}</span>` : '<span class="text-slate-600">—</span>'}</td>
+      <td class="py-2.5 text-right"><span class="pill ${ec}">${e==null?'—':(e>0?'+':'')+Math.round(e*100)}</span></td></tr>`;
+  }).join('');
+  return `<div class="card p-5 fade-in">${head}<div class="overflow-x-auto scroll-thin"><table class="w-full text-sm">
+    <thead><tr class="text-left text-[10px] uppercase tracking-wider text-slate-500 border-b border-slate-800"><th class="py-2 pr-2">#</th><th class="py-2 pr-3">Player</th><th class="py-2 pr-3">DK line</th><th class="py-2 pr-3 text-center">L10</th><th class="py-2 pr-3 text-center hidden sm:table-cell">Season</th><th class="py-2 pr-3 text-center hidden sm:table-cell">Matchup</th><th class="py-2 text-right">Edge</th></tr></thead>
+    <tbody>${body}</tbody></table></div>
+    <p class="text-[10px] text-slate-500 mt-3">Matchup = 0–100 blend of defense vs his position, team defense and pace (higher is friendlier). Edge = L10 hit rate minus DraftKings' no-vig Over chance.</p></div>`;
+}
+
+function selectPlayer(id, scroll=true, explicit=true){
+  S.playerId = id; S.userPicked = explicit;
   loadLog(id, true);
   renderAll();
   if(scroll && window.innerWidth < 1280) $('detail').scrollIntoView({behavior:'smooth', block:'start'});
@@ -588,7 +630,8 @@ function renderDetail(){
   if(S.loadingSlate && !S.playerId){ el.innerHTML = `<div class="card p-10 text-center text-slate-500"><span class="spin"></span><div class="mt-3 text-sm">Loading tonight's slate…</div></div>`; return; }
   if(!S.games.length){ el.innerHTML = `<div class="card p-10 text-center text-slate-400">No NBA games on ${esc(S.date)}. Pick another date above.</div>`; return; }
   const id = S.playerId;
-  if(!id || !S.players[id] && !S.props[id]){ el.innerHTML = `<div class="card p-10 text-center text-slate-400">Pick a player from the Prop Board or search above.</div>`; return; }
+  if(!id || !S.players[id] && !S.props[id]){ el.innerHTML = S.gameFilter==='all' ? topPropsHTML() : `<div class="card p-10 text-center text-slate-400">No DraftKings ${MK[S.market].label} props posted for this game yet. Try another stat or game.</div>`;
+    el.querySelectorAll('[data-tp]').forEach(tr=>tr.onclick=()=>selectPlayer(tr.dataset.tp)); return; }
   const p = S.players[id] || { name:'Player '+id, team:'', opp:'', pos:'' };
   const L = S.logs[id];
   const mk = MK[S.market];
@@ -597,7 +640,9 @@ function renderDetail(){
   const sp = splits(id, S.market);
   const loading = !L || L.status!=='ok';
 
+  const autoNote = !S.userPicked && game ? `<div class="flex flex-wrap items-center gap-2 text-xs text-slate-400 -mb-2"><span class="pill pill-hit">Top prop</span><span>#1 ${mk.label} prop in ${esc(game.short)} by ${SORT_LABEL[S.sort]}. Tap any player on the Prop Board to switch.</span></div>` : '';
   el.innerHTML = `
+    ${autoNote}
     ${heroHTML(p, game, sp, mk)}
     <div class="grid grid-cols-1 lg:grid-cols-3 gap-5">
       <div class="card p-5 glow">${oddsHTML(id, p, m, sp, mk)}</div>
@@ -948,6 +993,7 @@ function renderAll(){
   // keep focus on inputs inside detail from being destroyed mid-typing
   const ae = document.activeElement?.id;
   if(ae==='customLine' || ae==='calcOdds'){ renderBoard(); return; }
+  autoPick();
   renderGames(); renderTabs(); renderBoard(); renderDetail(); renderAgents(); renderMatchupBoard();
 }
 
@@ -1302,8 +1348,8 @@ function renderAgents(force){
   // wire
   const on = (id, f) => { const b = $(id); if(b) b.onclick = f; };
   on('agentRun', ()=>{ if(!AG.key){ AG.showSettings = true; AG.error = 'Add your free Gemini API key to run the team yourself.'; renderAgents(true); return; } runAgents(); });
-  const gm = $('agentGame'); if(gm) gm.onchange = () => { S.gameFilter = gm.value; AG.error = null; renderAll(); };
-  el.querySelectorAll('[data-rg]').forEach(b=>b.onclick=()=>{ S.gameFilter = b.dataset.rg; renderAll(); });
+  const gm = $('agentGame'); if(gm) gm.onchange = () => { AG.error = null; setGame(gm.value); };
+  el.querySelectorAll('[data-rg]').forEach(b=>b.onclick=()=>setGame(b.dataset.rg));
   on('agentGear', ()=>{ AG.showSettings = !AG.showSettings; renderAgents(true); });
   on('agentReports', ()=>{ AG.showReports = !AG.showReports; renderAgents(true); });
   on('agentSave', ()=>{ AG.key = $('agentKey').value.trim(); AG.model = $('agentModel').value; AG.nPicks = +$('agentN').value || 3;
@@ -1412,15 +1458,15 @@ $('search').addEventListener('keydown', e=>{
 });
 
 // ===== BOOT =====
-$('boardSort').onchange = e => { S.sort = e.target.value; renderBoard(); };
+$('boardSort').onchange = e => { S.sort = e.target.value; renderAll(); };
 $('refreshBtn').onclick = async () => {
-  const keep = S.playerId;
+  const keep = S.playerId, keepPicked = S.userPicked;
   setStatus('loading','Refreshing lines…');
   S.props = {};
   await Promise.all(S.games.map(loadProps));
   S.updatedAt = new Date(); setStatus('ok');
   Object.keys(S.props).forEach(id=>loadLog(id));
-  S.playerId = keep; renderAll();
+  S.playerId = keep; S.userPicked = keepPicked; renderAll();
 };
 $('datePick').onchange = e => { if(e.target.value){ S.date = e.target.value; loadSlate().then(loadPublishedPicks); } };
 
