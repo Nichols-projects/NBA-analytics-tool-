@@ -92,12 +92,18 @@ def r3(x):
 def main():
     season = season_str()
     print(f"Season {season}", flush=True)
-    # quick check first, so a blocked connection fails in seconds instead of 20 minutes
-    try:
-        req = urllib.request.Request(BASE + "scoreboardv2?" + urllib.parse.urlencode({"DayOffset": 0, "GameDate": datetime.now().strftime("%Y-%m-%d"), "LeagueID": "00"}), headers=HEADERS)
-        urllib.request.urlopen(req, timeout=25).read()
-    except Exception as e:  # noqa: BLE001
-        print(f"NBA.com is not reachable from this machine ({e}). It probably blocks this network.", flush=True)
+    # quick check first, so a blocked connection fails in about a minute instead of 20
+    ok = False
+    for ep, q in (("commonteamyears", {"LeagueID": "00"}), ("leaguestandingsv3", {"LeagueID": "00", "Season": season, "SeasonType": "Regular Season"})):
+        try:
+            req = urllib.request.Request(BASE + ep + "?" + urllib.parse.urlencode(q), headers=HEADERS)
+            urllib.request.urlopen(req, timeout=40).read()
+            ok = True
+            break
+        except Exception as e:  # noqa: BLE001
+            print(f"  connection check {ep} failed: {e}", flush=True)
+    if not ok:
+        print("NBA.com is not reachable from this machine. It probably blocks this network (VPN, cloud server).", flush=True)
         sys.exit(1)
     players, teams = {}, {}
 
