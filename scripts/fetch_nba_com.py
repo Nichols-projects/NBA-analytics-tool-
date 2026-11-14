@@ -99,7 +99,21 @@ def fetch(url, timeout=45):
     raise last
 
 
+# stats.nba.com answers "500" when a leaguedash* request leaves out any of its filters,
+# so send every filter with its blank default (same as the nba.com site does).
+LEAGUEDASH_DEFAULTS = {
+    "College": "", "Conference": "", "Country": "", "DateFrom": "", "DateTo": "", "Division": "",
+    "DraftPick": "", "DraftYear": "", "GameScope": "", "GameSegment": "", "Height": "", "LastNGames": 0,
+    "Location": "", "Month": 0, "OpponentTeamID": 0, "Outcome": "", "PORound": 0, "PaceAdjust": "N",
+    "Period": 0, "PlayerExperience": "", "PlayerPosition": "", "PlusMinus": "N", "Rank": "N",
+    "SeasonSegment": "", "ShotClockRange": "", "StarterBench": "", "TeamID": 0, "TwoWay": 0,
+    "VsConference": "", "VsDivision": "", "Weight": "",
+}
+
+
 def get(endpoint, params, tries=3):
+    if endpoint.startswith("leaguedash"):
+        params = {**LEAGUEDASH_DEFAULTS, **params}
     url = BASE + endpoint + "?" + urllib.parse.urlencode(params)
     for attempt in range(tries):
         try:
