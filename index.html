@@ -107,7 +107,7 @@
 
   <footer class="text-center text-[11px] text-slate-600 py-6 leading-relaxed">
     Live data: ESPN public feeds (DraftKings is ESPN's odds provider). Not affiliated with DraftKings, ESPN or the NBA. Lines can move or be pulled at any time, so confirm in the DK app before betting.<br/>
-    For research and entertainment. Gambling problem? Call 1-800-GAMBLER. · <span class="font-mono">v2.5</span>
+    For research and entertainment. Gambling problem? Call 1-800-GAMBLER. · <span class="font-mono">v2.6</span>
   </footer>
 </main>
 
@@ -1205,8 +1205,15 @@ const AGENTS = [
 ];
 const GEM = 'https://generativelanguage.googleapis.com/v1beta';
 
+// fetch with a hard time limit, so a request Gemini never answers can't hang the run
+async function fetchWithTimeout(url, init, ms){
+  const ctl = new AbortController(), timer = setTimeout(()=>ctl.abort(), ms);
+  try { return await fetch(url, { ...init, signal: ctl.signal }); }
+  catch(e){ if(e.name==='AbortError'){ const err = new Error(`no answer within ${Math.round(ms/1000)}s`); err.timeout = true; throw err; } throw e; }
+  finally { clearTimeout(timer); }
+}
 async function gemList(){
-  const r = await fetch(`${GEM}/models?pageSize=200`, { headers:{ 'x-goog-api-key': AG.key } });
+  const r = await fetchWithTimeout(`${GEM}/models?pageSize=200`, { headers:{ 'x-goog-api-key': AG.key } }, 15000);
   if(!r.ok) throw new Error(await gemErr(r));
   const j = await r.json();
   return (j.models||[]).filter(m => (m.supportedGenerationMethods||[]).includes('generateContent'))
@@ -1254,13 +1261,15 @@ async function gemJSON(system, user, who, opts={}){
       AG.status = `${who||'Agent'} asking ${model}${t?` (retry ${t})`:''}…`; renderAgents(true);
       let r;
       try {
-        r = await fetch(`${GEM}/models/${model}:generateContent`, {
+        r = await fetchWithTimeout(`${GEM}/models/${model}:generateContent`, {
           method:'POST', headers:{ 'Content-Type':'application/json', 'x-goog-api-key': AG.key },
           body: JSON.stringify(opts.search
             ? { contents:[{ role:'user', parts:[{ text: user }] }], tools:[{ google_search:{} }], generationConfig:{ temperature:0.2 } }
             : { systemInstruction:{ parts:[{ text: system }] }, contents:[{ role:'user', parts:[{ text: user }] }], generationConfig:{ responseMimeType:'application/json', temperature:0.35 } })
-        });
-      } catch(e){ lastErr = new Error('Could not reach Gemini. Check your internet connection.'); if(t<delays.length){ await wait(delays[t]); continue; } break; }
+        }, opts.search ? 45000 : 60000);   // agents send big prompts and need up to ~a minute; the search step gets 45s
+      } catch(e){
+        if(e.timeout){ lastErr = new Error(`${model} gave ${e.message}`); bad.add(model); AG.status = `${model} didn't answer in time, switching model…`; renderAgents(true); break; }
+        lastErr = new Error('Could not reach Gemini. Check your internet connection.'); if(t<delays.length){ await wait(delays[t]); continue; } break; }
       if(r.ok){
         const j = await r.json();
         if(opts.search){ const t = (j.candidates?.[0]?.content?.parts||[]).map(p=>p.text||'').join('').trim(); if(t){ AG.status=''; return t; } lastErr = new Error('the search came back empty'); break; }
@@ -1410,7 +1419,7 @@ async function runAgents(){
   const gameId = S.gameFilter, game = S.games.find(g=>g.id===gameId);
   if(!game){ AG.error = 'Pick a game first, either with the game buttons at the top or the game menu here.'; renderAgents(true); return; }
   if(!AG.key){ AG.showSettings = true; AG.error = 'Add your free Gemini API key first.'; renderAgents(true); return; }
-  AG.running = true; AG.runningGame = gameId; AG.lastGame = gameId; AG.error = null; AG.reconNote = null; AG.badSearch = new Set(); delete AG.results[gameId]; AG.usedModel = null; AG.badModels = new Set(); AG.steps = { prep:'run' }; renderAgents(true);
+  AG.running = true; AG.runningGame = gameId; AG.lastGame = gameId; AG.error = null; AG.reconNote = null; AG.badSearch = new Set(); AG.skipped = []; delete AG.results[gameId]; AG.usedModel = null; AG.badModels = new Set(); AG.steps = { prep:'run' }; renderAgents(true);
   try{
     AG.deadline = Date.now() + 4*60*1000; AG.cancel = false;
     try { AG.models = await gemList(); } catch(e){ if(/API key|refused the key/i.test(e.message)) throw e; }
@@ -1439,14 +1448,19 @@ async function runAgents(){
       await new Promise(res=>setTimeout(res, 1500));
       AG.steps[k] = 'run'; renderAgents(true);
       try { reports[k] = await gemJSON(AGENT_BASE+'\n\n'+AGENT_PROMPTS[k], ctx, NAMES[k]); AG.steps[k]='done'; }
-      catch(e){ AG.steps[k]='fail'; renderAgents(true); throw e; }
+      catch(e){
+        AG.steps[k]='fail'; renderAgents(true);
+        if(/API key|refused the key|Run stopped|too busy right now/i.test(e.message)) throw e;   // can't recover from these
+        reports[k] = null; (AG.skipped ||= []).push(`${NAMES[k]} (${e.message.replace(/\.$/,'')})`);   // move on with the others
+      }
       renderAgents(true);
     }
     const { quinn, scout, vig } = reports;
+    if(!scout && !quinn && !vig) throw new Error(`No analyst could get an answer from Gemini: ${AG.skipped.join('; ')}.`);
     await new Promise(res=>setTimeout(res, 1500));
     AG.steps.chief = 'run'; renderAgents(true);
     const chief = await gemJSON(AGENT_BASE+'\n\n'+AGENT_PROMPTS.chief(AG.nPicks),
-      `${ctx}\n\nScout report (lead):\n${JSON.stringify(scout)}\n\nQuinn report:\n${JSON.stringify(quinn)}\n\nVig report:\n${JSON.stringify(vig)}`, AG.names.chief);
+      `${ctx}\n\nScout report (lead):\n${scout?JSON.stringify(scout):'unavailable this run'}\n\nQuinn report:\n${quinn?JSON.stringify(quinn):'unavailable this run'}\n\nVig report:\n${vig?JSON.stringify(vig):'unavailable this run'}`, AG.names.chief);
     AG.steps.chief = 'done';
     const byId = Object.fromEntries(cands.map(c=>[c.id,c]));
     const noteMap = r => Object.fromEntries((r?.notes||[]).map(n=>[n.id,n]));
@@ -1574,6 +1588,7 @@ function renderAgents(force){
         </ul></div>` : ''}
     ${AG.running || (Object.keys(AG.steps).length && !R && AG.lastGame===S.gameFilter) ? `<div class="flex flex-wrap gap-2 mt-4">${['recon','scout','quinn','vig','chief'].map(stepPill).join('')}</div>` : ''}
     ${AG.running && AG.status?`<div class="mt-3 text-xs font-mono text-slate-400">${esc(AG.status)}</div>`:''}
+    ${AG.skipped?.length && AG.lastGame===S.gameFilter?`<div class="mt-2 text-[11px] text-yellow-300/80">Report missing this run: ${AG.skipped.map(esc).join('; ')}. ${esc(AG.names.chief)} decided with the others.</div>`:''}
     ${AG.reconNote && AG.lastGame===S.gameFilter?`<div class="mt-2 text-[11px] text-yellow-300/80">Live search skipped (${esc(AG.reconNote)}). The team runs without it.</div>`:''}
     ${AG.error?`<div class="mt-3 text-sm text-red-400">${esc(AG.error)}</div>`:''}
     ${!gSel && !AG.running && !allRes.length ? `<div class="mt-3 text-xs text-slate-500">Pick a game from the menu above and tap Run to have the agent team break it down. ${AG.key?'':'Add your free Gemini key in Settings first (it stays in this browser only).'}</div>` : ''}
