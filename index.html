@@ -107,7 +107,7 @@
 
   <footer class="text-center text-[11px] text-slate-600 py-6 leading-relaxed">
     Live data: ESPN public feeds (DraftKings is ESPN's odds provider). Not affiliated with DraftKings, ESPN or the NBA. Lines can move or be pulled at any time, so confirm in the DK app before betting.<br/>
-    For research and entertainment. Gambling problem? Call 1-800-GAMBLER. · <span class="font-mono">v2.6</span>
+    For research and entertainment. Gambling problem? Call 1-800-GAMBLER. · <span class="font-mono">v2.7</span>
   </footer>
 </main>
 
@@ -1190,14 +1190,13 @@ AG.names = { ...AGENT_DEFAULT_NAMES, ...(lsGet('dkat-agent-names') || {}) };
 AG.showGuide = !lsGet('dkat-guide-seen');
 const an = k => esc(AG.names[k==='recon' ? 'scout' : k] || AGENT_DEFAULT_NAMES[k==='recon' ? 'scout' : k]);
 const TEAM_GUIDE = [
-  { key:'scout', role:'Matchup lead', weight:'50% of the vote', does:'Starts every run with a live Google search on the game (injuries, lineups, minutes limits, each defense’s scheme). Then grades each Over on the matchup: what the defense allows to his position, play types and shot zones, pace, teammates out, and blowout risk.' },
+  { key:'scout', role:'Matchup lead', weight:'50% of the vote', does:'Grades each Over on the matchup: what the defense allows to his position, play types and shot zones, pace, teammates out, blowout risk and the referee crew.' },
   { key:'quinn', role:'Quant', weight:'30%', does:'The numbers check. Is the line inside his realistic range? Looks at averages vs the line, game-to-game swings, minutes, and volume stats like rebound chances and potential assists.' },
   { key:'vig',   role:'Market', weight:'20%', does:'Reads DraftKings: where the line opened and how it moved, the juice, the no-vig price, and lines that look like traps.' },
-  { key:'chief', role:'Mission Control', weight:'Final call', does:'Weighs the three reports and picks the Overs most likely to hit, ranked by conviction (1–10). Every pick needs a real matchup reason; a hot streak alone isn’t enough. Drops anyone the recon says is out or limited.' },
+  { key:'chief', role:'Mission Control', weight:'Final call', does:'Weighs the three reports and picks the Overs most likely to hit, ranked by conviction (1–10). Every pick needs a real matchup reason; a hot streak alone isn’t enough. Uses ESPN’s injury report for who’s out.' },
 ];
 
 const AGENTS = [
-  { key:'recon', name:'Scout', role:'Live recon' },
   { key:'quinn', name:'Quinn', role:'Quant' },
   { key:'scout', name:'Scout', role:'Matchup lead' },
   { key:'vig',   name:'Vig',   role:'Market' },
@@ -1257,7 +1256,7 @@ async function gemJSON(system, user, who, opts={}){
   for(const model of chain){
     for(let t=0; t<=delays.length; t++){
       if(AG.cancel) throw new Error('Run stopped.');
-      if(AG.deadline && Date.now() > AG.deadline) throw new Error('Gemini is too busy right now (no usable answer in 4 minutes). Try again in a bit, or pick a different model in Settings.');
+      if(AG.deadline && Date.now() > AG.deadline) throw new Error('Gemini is too busy right now (no usable answer in 3 minutes). Try again in a bit, or pick a different model in Settings.');
       AG.status = `${who||'Agent'} asking ${model}${t?` (retry ${t})`:''}…`; renderAgents(true);
       let r;
       try {
@@ -1266,7 +1265,7 @@ async function gemJSON(system, user, who, opts={}){
           body: JSON.stringify(opts.search
             ? { contents:[{ role:'user', parts:[{ text: user }] }], tools:[{ google_search:{} }], generationConfig:{ temperature:0.2 } }
             : { systemInstruction:{ parts:[{ text: system }] }, contents:[{ role:'user', parts:[{ text: user }] }], generationConfig:{ responseMimeType:'application/json', temperature:0.35 } })
-        }, opts.search ? 45000 : 60000);   // agents send big prompts and need up to ~a minute; the search step gets 45s
+        }, 75000);   // one compact team request usually answers in 15-40s; 75s is the hard stop per try
       } catch(e){
         if(e.timeout){ lastErr = new Error(`${model} gave ${e.message}`); bad.add(model); AG.status = `${model} didn't answer in time, switching model…`; renderAgents(true); break; }
         lastErr = new Error('Could not reach Gemini. Check your internet connection.'); if(t<delays.length){ await wait(delays[t]); continue; } break; }
@@ -1358,50 +1357,39 @@ function buildCandidates(gameId, maxN=25){
   return picked;
 }
 
-const AGENT_BASE = `You are part of "Agent Endzone: Hardwood", a private NBA player-prop research team working for one bettor who bets only at DraftKings and only plays OVERS. Every candidate is an Over bet; judge only whether the Over hits. Never recommend an Under.
-The team's philosophy: MATCHUP FIRST. A prop is worth playing when tonight's specific matchup, pace, role and game script push the player's production up, not just because he hit recently. Recent trends are supporting evidence, never the main reason.
-All data is real, pulled tonight from ESPN box scores and DraftKings for ONE game. Field guide:
-- positionGroup: G, F or C. oppPosRankVsMarket: how the opponent ranks in this stat allowed to players at HIS position (1 = allows the fewest, toughest; 30 = allows the most, softest). oppAllowedToPosPerGame: that stat allowed per game to his position group.
-- oppDefRankVsMarket / oppAllowedPerGame: same idea for the whole team, not position-specific.
-- oppPace / oppPaceRank and teamPaceRank: possessions per game (rank 1 = fastest). Two fast teams = more possessions = more counting stats.
-- withoutTeammates: his production THIS SEASON in games without each teammate ruled out tonight (gamesWithout, avgWithout, overHitsWithout vs gamesWith, avgWith). If gamesWith is 0 the absence is already baked into his recent numbers; if gamesWith > 0 it is a NEW absence and the usage shift matters.
-- overHits like "7/10": games he went OVER tonight's line (same line applied to past games). restDays 0 = back-to-back. spread/gameTotal hint at game script and blowout risk.
-- model: the app's projection (projected minutes x production per minute, adjusted for matchup, pace, teammates out and blowout risk). overPct = its chance the Over hits; edgePts = overPct minus DraftKings' fair price. It is the best single number here, but it can't see late news or scheme details, so adjust it for those.
-- matchupScore (0-100, higher = friendlier) and trendScore (0-100) are the app's own quick formulas; form your own view.
-- nbaCom (when present, from NBA.com): playTypes = his main play types (freqPct of his possessions, ppp = points per possession) vs the opponent's defense on that play type (oppDefPPP allowed and oppDefRank: 1 = allows the fewest points per possession, toughest; 30 = most, softest). shotZones = where he shoots (share of his shots, his FG%) vs the opponent's FG% allowed in that zone (oppZoneRank 1 = toughest, 30 = softest). tracking: rebChances = rebound opportunities per game (the volume behind rebound props), potAst = potential assists per game (passes that led to shots; far above his assists means assists should rise), touches, drives, catch-and-shoot and pull-up attempts. usagePct vs usagePctL5 shows whether his role is growing.
-- blowout: chance his team is up or down 15+ entering the 4th quarter (when coaches start pulling starters), his share of normal minutes in those games, and the effect already applied to the model. Bad teams often compete early and fold late, so this is about the 4th quarter, not the final score.
-- refCrew: tonight's referees vs league average (fouls, free-throw attempts, points per game, and how often their games went over the closing total). Whistle-heavy crews help players who live at the line and hurt foul-prone bigs' minutes. It's a supporting factor, not a main reason.
-- recon (when present): live notes from a web search tonight about injuries, lineups and each team's defensive scheme. Trust it for news; ignore anything it marks as not found.
-Early-season ranks use small samples; say so when it matters. Use only the data provided, never invent stats or news. Be concise and specific. Respond with JSON only.`;
+// One Gemini request per game: Scout, Quinn, Vig and Chief all grade in a single pass from the same compact data.
+const TEAM_PROMPT = (n, names) => `You are "Agent Endzone: Hardwood", a four-analyst NBA player-prop team working for one bettor who bets only at DraftKings and only plays OVERS. Judge only whether each Over hits. Never recommend an Under.
+Philosophy: MATCHUP FIRST. An Over is worth playing when tonight's matchup, pace, role and game script push his production up, not just because he hit recently.
+The data is real (ESPN, DraftKings, NBA.com) for ONE game. Field guide:
+- model: the app's projection (projected minutes x production per minute, adjusted for matchup, pace, teammates out, blowout risk and refs). overPct = its chance the Over hits; edge = overPct minus DraftKings' fair price (vig removed). It's the best single number; adjust it only for a specific reason.
+- hits "7/10" = games he went over TONIGHT's line. posRank: opponent's rank in this stat allowed to his position (1 = toughest, 30 = softest). paceRanks: [opponent, his team], 1 = fastest.
+- out: players ruled out tonight. without: his numbers this season in games without a teammate who's out tonight (only new absences listed).
+- nba: his top play types and shot zones vs the opponent's defensive rank on them (30 = softest), rebound chances (rebCh), potential assists (potAst), usage now vs last 5.
+- blowout: chance his team is up or down 15+ entering the 4th quarter (when starters sit), and the effect already in the model. refs: tonight's crew vs league average.
+Roles (all four of you weigh in):
+- ${names.scout} (Matchup lead, 50% of the vote): position defense, play types and zones, pace, injuries and usage, game script, refs. Grade 8-10 only when the matchup actively boosts the Over.
+- ${names.quinn} (Quant, 30%): is the line inside his realistic range? Start from model.overPct; use volume (rebCh, potAst, minutes) and sample sizes.
+- ${names.vig} (Market, 20%): line movement and juice, model edge vs the price, trap lines.
+- ${names.chief} (final call): pick up to ${n} Overs most likely to hit, ranked by conviction. Every pick needs a concrete matchup or usage reason (Scout grade 6+). Max one pick per player. Skip juice worse than -200 unless exceptional. hitPct should stay within about 10 points of model.overPct unless you give a specific reason. The headline must name the same stat and line as the pick.
+Use only the data given. Be brief. Respond with JSON only, exactly this shape:
+{"summary":"1-2 sentences on how this game sets up for Overs","picks":[{"id":"c1","conviction":1-10,"hitPct":0-100,"keyFactor":"position|playtype|zone|tracking|pace|usage|script|refs|rest","headline":"max 10 words","why":"max 40 words with the key numbers","risks":["short risk"],"scout":{"grade":1-10,"note":"max 15 words"},"quinn":{"grade":1-10,"prob":0-100,"note":"max 15 words"},"vig":{"grade":1-10,"note":"max 15 words"}}],"fades":[{"id":"cX","note":"max 12 words on why the team passed"}]}`;
 
-const AGENT_PROMPTS = {
-  scout: `You are Scout, the LEAD Matchup analyst. Your grade carries the most weight with Chief.
-Build every read in this order: (1) position matchup: oppPosRankVsMarket and oppAllowedToPosPerGame for his position and this stat; (1b) when nbaCom is present: his top play types vs the opponent's rank guarding them, his main shot zones vs their zone defense, and for rebound/assist props the tracking volume (rebChances, potAst); (2) pace of both teams; (3) usage shifts from injuries using withoutTeammates, NEW absences first; (4) defensive scheme and late news from recon (examples: drop coverage gives ball handlers pull-up looks and lets bigs rebound; switch-heavy teams invite isolation scoring; zone limits rim attempts and gives up threes; elite rim protection hurts interior scorers; poor defensive rebounding helps opposing bigs); (5) game script: use blowout (4th-quarter minute risk; injuries make late collapses likelier), plus spread and total; (6) referees: refCrew for free-throw-heavy scorers and foul-prone bigs; (7) rest. Use trends only as a tiebreaker.
-Grade 8-10 only when the matchup actively boosts the Over (for example: his #1 play type faces a bottom-5 defense of it, or his main zone faces a soft zone defense). Grade 4 or lower when the matchup works against it, however hot he is.
-For EVERY candidate return: {"notes":[{"id":"c1","lean":"Over|Pass","grade":1-10,"keyFactor":"position|playtype|zone|tracking|pace|usage|scheme|script|refs|rest","note":"max 25 words, cite the matchup numbers"}]}`,
-  quinn: `You are Quinn, the Quant and the team's sanity check, not the driver. For each prop ask: is tonight's line inside his realistic range? Use averages vs line relative to sdL20 (volatility), minutes stability (minL5 vs minThisSeason), sample sizes, and whether the withoutTeammates numbers are a real sample or noise. When nbaCom tracking is present, use rebChances and potAst as the underlying volume: a rebound line below what his rebound chances support, or potential assists well above his assist average, is a real statistical edge; usagePctL5 above usagePct means a growing role. Flag props where the matchup story needs a level of production he rarely reaches.
-Start from model.overPct and say whether you'd move it up or down and why.
-For EVERY candidate return: {"notes":[{"id":"c1","lean":"Over|Pass","prob":0-100 (chance the Over hits),"grade":1-10,"note":"max 20 words"}]}`,
-  vig: `You are Vig, the Market analyst. Judge each Over on the DraftKings market: line and price movement from open to now (movement toward the Over means money agrees), juice, no-vig fair probability vs your read, lines that look set low or high vs his averages and matchup (possible traps), and nearby alt-ladder prices.
-For EVERY candidate return: {"notes":[{"id":"c1","lean":"Over|Pass","grade":1-10,"note":"max 20 words"}]}`,
-  chief: n => `You are Chief, Mission Control. You get one game's candidate OVER props, live recon notes, and reports from Scout (Matchup, lead), Quinn (Quant) and Vig (Market).
-Pick up to ${n} OVERS most likely to hit, ranked by conviction (probability of hitting), not price value. Fewer is fine if fewer are worth it. The bettor makes the final call, so be candid.
-Weighting: Scout 50%, Quinn 30%, Vig 20%. Rules:
-- Every pick needs a concrete matchup or usage reason (Scout grade 6 or higher). Never pick on recent trend alone.
-- Drop any player the recon says is out, doubtful or on a minutes limit.
-- hitPct should stay within about 10 points of model.overPct unless the recon or a specific matchup reason justifies moving it; say so in "why".
-- Prefer Overs with a positive model.edgePts; an Over the model prices below DraftKings needs a strong, specific reason.
-- Overs only. Max one pick per player. Avoid stacking picks that all need the same game script. Skip juice worse than -200 unless conviction is exceptional.
-- The headline must name the same stat and line as the pick. "why" must cite the matchup numbers (position rank, play-type or zone rank, pace, with/without, scheme) and at most one trend number.
-Return: {"summary":"2 sentences on how this matchup sets up for Overs","picks":[{"id":"c1","side":"Over","conviction":1-10,"hitPct":0-100 (chance the Over hits),"agree":"3/3|2/3","keyFactor":"position|playtype|zone|tracking|pace|usage|scheme|script","headline":"max 10 words","why":"max 45 words","risks":["short risk"]}],"fades":[{"id":"cX","note":"max 15 words on why the team passed on a tempting prop"}]}`
-};
-const RECON_PROMPT = (g, date) => `Use Google Search to research tonight's NBA game: ${g.away.name} at ${g.home.name} on ${date}.
-In under 180 words of plain text, cover:
-1) Injury report: who is out, doubtful or questionable on each team, plus any minutes restrictions.
-2) Lineup news: projected starters or rotation changes.
-3) Defensive scheme for each team this season: pick-and-roll coverage (drop, switch, hedge/blitz), zone usage, rim protection, and which positions or player types they struggle to guard.
-4) Pace and style notes.
-Only state what the search results support. Write "not found" for anything you cannot confirm. No betting advice.`;
+// Trim a candidate to what the team actually needs (keeps each request small and fast).
+function compactCand(c){
+  const nb = c.nbaCom;
+  return { id:c.id, player:c.player, pos:c.positionGroup, team:c.team, opp:c.opp, venue:c.venue, market:c.market, line:c.line,
+    odds:c.overOdds, fairOverPct:c.noVigOverPct, lineMove: c.openLine!==c.line ? `${c.openLine} -> ${c.line}` : 'none',
+    model: c.model ? { proj:c.model.projection, min:c.model.minutesProj, overPct:c.model.overPct, edge:c.model.edgePts } : null,
+    hits: { L10:c.overHits.L10, season:c.overHits.thisSeason, lastSeason:c.overHits.lastSeason, vsOpp:c.overHits.vsOpp },
+    avgL10:c.avgL10, avgSeason:c.avgThisSeason, sd:c.sdL20, minL5:c.minL5, rest:c.restDays,
+    posRank:c.oppPosRankVsMarket, paceRanks:[c.oppPaceRank, c.teamPaceRank],
+    out: { team:(c.teammatesOut||[]).slice(0,3), opp:(c.opponentsOut||[]).slice(0,3) },
+    without: (c.withoutTeammates||[]).filter(w=>w.gamesWith>0 && w.gamesWithout>0).slice(0,2).map(w=>`${w.teammate}: ${w.avgWithout} without (${w.gamesWithout}g) vs ${w.avgWith} with`),
+    nba: nb ? { play:(nb.playTypes||[]).slice(0,2).map(t=>`${t.playType} ${t.freqPct}% (opp #${t.oppDefRank??'-'})`), zones:(nb.shotZones||[]).slice(0,2).map(z=>`${z.zone} ${z.shareOfShotsPct}% (opp #${z.oppZoneRank??'-'})`),
+      rebCh: nb.tracking?.rebChances, potAst: nb.tracking?.potAst, usage: nb.usagePct!=null ? `${nb.usagePct}% (L5 ${nb.usagePctL5})` : null } : null,
+    blowout: c.blowout ? `up15 ${c.blowout.teamUp15EnteringQ4Pct}% / down15 ${c.blowout.teamDown15EnteringQ4Pct}% (model ${c.blowout.projectionEffectPct>=0?'+':''}${c.blowout.projectionEffectPct}%)` : null,
+    refs: c.refCrew ? `${c.refCrew.label}, FTA ${c.refCrew.ftaVsAvg>=0?'+':''}${c.refCrew.ftaVsAvg}, overs ${c.refCrew.gamesOverTotalPct}%` : null };
+}
 
 // Picks the GitHub job publishes each day (picks.json), shown to every visitor without a Gemini key
 async function loadPublishedPicks(){
@@ -1419,9 +1407,9 @@ async function runAgents(){
   const gameId = S.gameFilter, game = S.games.find(g=>g.id===gameId);
   if(!game){ AG.error = 'Pick a game first, either with the game buttons at the top or the game menu here.'; renderAgents(true); return; }
   if(!AG.key){ AG.showSettings = true; AG.error = 'Add your free Gemini API key first.'; renderAgents(true); return; }
-  AG.running = true; AG.runningGame = gameId; AG.lastGame = gameId; AG.error = null; AG.reconNote = null; AG.badSearch = new Set(); AG.skipped = []; delete AG.results[gameId]; AG.usedModel = null; AG.badModels = new Set(); AG.steps = { prep:'run' }; renderAgents(true);
+  AG.running = true; AG.runningGame = gameId; AG.lastGame = gameId; AG.error = null; AG.skipped = []; delete AG.results[gameId]; AG.usedModel = null; AG.badModels = new Set(); AG.steps = { prep:'run' }; renderAgents(true);
   try{
-    AG.deadline = Date.now() + 4*60*1000; AG.cancel = false;
+    AG.deadline = Date.now() + 3*60*1000; AG.cancel = false;
     try { AG.models = await gemList(); } catch(e){ if(/API key|refused the key/i.test(e.message)) throw e; }
     if(AG.models?.length && AG.model && !AG.models.includes(AG.model)){ AG.model = ''; lsSet('dkat-gemini-model', ''); }
     if(!AG.model) AG.model = pickDefaultModel(AG.models);
@@ -1430,47 +1418,25 @@ async function runAgents(){
     if(BOX.status!=='ready') await new Promise(res=>{ const t=setInterval(()=>{ AG.status = `Loading this season's box scores for matchup data (${BOX.done}/${BOX.total})…`; renderAgents(true); if(BOX.status==='ready'){ clearInterval(t); res(); } }, 1000); setTimeout(()=>{ clearInterval(t); res(); }, 150000); });
     if(BOX.status==='ready' && !S.match) computeMatchups();
     if(game.status.state && game.status.state!=='pre') throw new Error(`${game.short} has already started. DraftKings pulls pregame props at tip-off.`);
-    const cands = buildCandidates(gameId, 25);
+    const cands = buildCandidates(gameId, 12);
     if(cands.length < 2) throw new Error(`Not enough Over props with DraftKings lines for ${game.short} yet. DK usually posts them the day of the game.`);
     AG.steps = { prep:'done' }; renderAgents(true);
-    const data = JSON.stringify(cands.map(({pid,mkey,...c})=>c));
-    // 1) live recon via Google Search (optional: the run continues without it)
-    let recon = null;
-    AG.steps.recon = 'run'; renderAgents(true);
-    try { recon = await gemJSON('', RECON_PROMPT(game, new Date(game.date).toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric'})), `${AG.names.scout} recon`, { search:true }); AG.steps.recon = 'done'; }
-    catch(e){ if(/API key|refused the key/i.test(e.message)) throw e; AG.steps.recon = 'fail'; recon = null;
-      AG.reconNote = /daily|per day|limit/i.test(e.message) ? 'the free daily Google Search allowance on your Gemini key is used up; it resets overnight' : e.message.replace(/\.$/,''); }
-    renderAgents(true);
-    const ctx = `${game.short} Over candidates (${cands.length}):\n${data}\n\nrecon (live web search notes):\n${recon || 'unavailable tonight'}`;
-    const NAMES = { quinn:AG.names.quinn, scout:AG.names.scout, vig:AG.names.vig };
-    const reports = {};
-    for(const k of ['scout','quinn','vig']){                      // one at a time, so Gemini isn't hit all at once
-      await new Promise(res=>setTimeout(res, 1500));
-      AG.steps[k] = 'run'; renderAgents(true);
-      try { reports[k] = await gemJSON(AGENT_BASE+'\n\n'+AGENT_PROMPTS[k], ctx, NAMES[k]); AG.steps[k]='done'; }
-      catch(e){
-        AG.steps[k]='fail'; renderAgents(true);
-        if(/API key|refused the key|Run stopped|too busy right now/i.test(e.message)) throw e;   // can't recover from these
-        reports[k] = null; (AG.skipped ||= []).push(`${NAMES[k]} (${e.message.replace(/\.$/,'')})`);   // move on with the others
-      }
-      renderAgents(true);
-    }
-    const { quinn, scout, vig } = reports;
-    if(!scout && !quinn && !vig) throw new Error(`No analyst could get an answer from Gemini: ${AG.skipped.join('; ')}.`);
-    await new Promise(res=>setTimeout(res, 1500));
-    AG.steps.chief = 'run'; renderAgents(true);
-    const chief = await gemJSON(AGENT_BASE+'\n\n'+AGENT_PROMPTS.chief(AG.nPicks),
-      `${ctx}\n\nScout report (lead):\n${scout?JSON.stringify(scout):'unavailable this run'}\n\nQuinn report:\n${quinn?JSON.stringify(quinn):'unavailable this run'}\n\nVig report:\n${vig?JSON.stringify(vig):'unavailable this run'}`, AG.names.chief);
-    AG.steps.chief = 'done';
+    const data = JSON.stringify(cands.map(compactCand));
+    ['scout','quinn','vig','chief'].forEach(k=>AG.steps[k]='run'); renderAgents(true);
+    const started = Date.now();
+    const tick = setInterval(()=>{ if(AG.running && !/busy|switching|retry|didn't answer/i.test(AG.status||'')){ AG.status = `Agent team analyzing ${game.short} with ${AG.usedModel||AG.model}… ${Math.round((Date.now()-started)/1000)}s`; renderAgents(true); } }, 1000);
+    let team;
+    try { team = await gemJSON(TEAM_PROMPT(AG.nPicks, AG.names), `${game.short}: ${cands.length} Over candidates\n${data}`, 'Agent team'); }
+    finally { clearInterval(tick); }
+    ['scout','quinn','vig','chief'].forEach(k=>AG.steps[k]='done');
+    const chief = team;
     const byId = Object.fromEntries(cands.map(c=>[c.id,c]));
-    const noteMap = r => Object.fromEntries((r?.notes||[]).map(n=>[n.id,n]));
-    const Q = noteMap(quinn), Sc = noteMap(scout), V = noteMap(vig);
     const seen = new Set();
-    const picks = (chief?.picks||[]).filter(p=>byId[p.id] && !/under/i.test(p.side||'') && !seen.has(byId[p.id].pid) && seen.add(byId[p.id].pid)).map(p=>({ ...p, side:'Over', cand: byId[p.id], q:Q[p.id], s:Sc[p.id], v:V[p.id] }))
+    const picks = (chief?.picks||[]).filter(p=>byId[p.id] && !/under/i.test(p.side||'') && !seen.has(byId[p.id].pid) && seen.add(byId[p.id].pid)).map(p=>({ ...p, side:'Over', cand: byId[p.id], s: p.scout ? { ...p.scout, lean:'Over', keyFactor:p.keyFactor } : null, q: p.quinn ? { ...p.quinn, lean:'Over' } : null, v: p.vig ? { ...p.vig, lean:'Over' } : null }))
       .sort((a,b)=>(b.conviction||0)-(a.conviction||0) || (b.hitPct||0)-(a.hitPct||0));
     const fades = (chief?.fades||[]).filter(f=>byId[f.id]).map(f=>({ ...f, cand: byId[f.id] }));
     if(!picks.length) throw new Error('Chief found no Overs worth taking in this game. Try another game or run again.');
-    AG.results[gameId] = { at: Date.now(), date: S.date, gameId, game: game.short, model: AG.usedModel || AG.model, summary: chief.summary||'', picks: picks.slice(0, AG.nPicks), fades, nCands: cands.length, recon };
+    AG.results[gameId] = { at: Date.now(), date: S.date, gameId, game: game.short, model: AG.usedModel || AG.model, summary: chief.summary||'', picks: picks.slice(0, AG.nPicks), fades, nCands: cands.length };
     lsSet('dkat-agents2-'+S.date, AG.results);
     trLogAgentPicks(AG.results[gameId]);
   }catch(e){ AG.error = e.message || String(e); }
@@ -1546,7 +1512,7 @@ function renderAgents(force){
       <div class="flex gap-1.5 flex-wrap items-center mt-auto pt-1">${gradeChip(an('scout'),p.s)}${gradeChip(an('quinn'),p.q)}${gradeChip(an('vig'),p.v)}${(()=>{ const e = trFind(R2date(gid), c.pid, c.mkey); return e?.bet ? `<span class="ml-auto text-[11px] font-semibold text-neon">✓ Bet ${e.bet.units}u</span>` : `<span data-bet="${gid}:${i}" role="button" class="ml-auto text-[11px] font-bold rounded-md px-2 py-1 bg-neon/15 text-neon border border-neon/40 hover:bg-neon/25">I bet this</span>`; })()}</div>
     </button>`;
   };
-  const reports = R ? `${R.recon?`<div class="mt-4 rounded-lg border border-slate-800 bg-slate-950/50 p-3"><div class="text-[10px] uppercase tracking-wider text-slate-500 mb-1">${an('scout')}'s live recon (Google Search)</div><div class="text-xs text-slate-300 whitespace-pre-line leading-relaxed">${esc(R.recon)}</div></div>`:`<div class="mt-4 text-[11px] text-slate-500">Live recon was unavailable for this run.</div>`}<div class="mt-4 overflow-x-auto scroll-thin"><table class="w-full text-xs"><thead><tr class="text-left text-[10px] uppercase tracking-wider text-slate-500 border-b border-slate-800"><th class="py-2 pr-2">Pick</th><th class="py-2 pr-2">${an('scout')} (Matchup lead)</th><th class="py-2 pr-2">${an('quinn')} (Quant)</th><th class="py-2">${an('vig')} (Market)</th></tr></thead><tbody>
+  const reports = R ? `<div class="mt-4 overflow-x-auto scroll-thin"><table class="w-full text-xs"><thead><tr class="text-left text-[10px] uppercase tracking-wider text-slate-500 border-b border-slate-800"><th class="py-2 pr-2">Pick</th><th class="py-2 pr-2">${an('scout')} (Matchup lead)</th><th class="py-2 pr-2">${an('quinn')} (Quant)</th><th class="py-2">${an('vig')} (Market)</th></tr></thead><tbody>
       ${R.picks.map(p=>`<tr class="border-b border-slate-800/60 align-top"><td class="py-2 pr-2 font-semibold whitespace-nowrap">${esc(p.cand.player.split(' ').slice(-1)[0])} ${esc(p.side[0])} ${p.cand.line} ${esc(p.cand.market)}</td>${[p.s,p.q,p.v].map(n=>`<td class="py-2 pr-2 text-slate-400 min-w-[160px]">${n?`<b class="text-slate-300">${esc(n.lean||'')} ${n.grade??''}/10${n.prob!=null?' · '+n.prob+'%':''}${n.keyFactor?' · '+esc(n.keyFactor):''}</b> ${esc(n.note||'')}`:'—'}</td>`).join('')}</tr>`).join('')}
     </tbody></table>
     ${R.fades?.length?`<div class="mt-3 text-xs text-slate-400"><span class="font-semibold text-slate-300">Passed on:</span> ${R.fades.map(f=>`${esc(f.cand.player)} ${esc(f.cand.market)} ${f.cand.line} (${esc(f.note||'')})`).join(' · ')}</div>`:''}</div>` : '';
@@ -1572,7 +1538,7 @@ function renderAgents(force){
     </div>
     ${AG.showGuide ? `<div class="mt-4 rounded-xl border border-sky-400/30 bg-sky-400/5 p-4">
         <div class="flex items-start justify-between gap-3"><div><div class="font-bold text-sm">Meet the agent team</div>
-          <p class="text-xs text-slate-400 mt-1 max-w-3xl">Four AI analysts break down one game at a time and hand you the Overs most likely to hit. Pick a game, tap <b class="text-slate-200">Run</b>, and about 1–2 minutes later you get ranked picks with the reasons and risks. You make the final call.</p></div>
+          <p class="text-xs text-slate-400 mt-1 max-w-3xl">Four AI analysts break down one game at a time and hand you the Overs most likely to hit. Pick a game, tap <b class="text-slate-200">Run</b>, and in under a minute you get ranked picks with the reasons and risks. All four work from the same data in one pass. You make the final call.</p></div>
           <button id="agentGuideClose" class="text-xs font-bold bg-neon text-slate-950 rounded-md px-3 py-1.5 shrink-0">Got it</button></div>
         <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3 mt-3">
           ${TEAM_GUIDE.map((t,i)=>`<div class="rounded-lg border border-slate-700 bg-slate-900/60 p-3 min-w-0">
@@ -1582,14 +1548,13 @@ function renderAgents(force){
         </div>
         <ul class="mt-3 text-[11px] text-slate-400 space-y-1 list-disc pl-4">
           <li><b class="text-slate-300">Overs only.</b> Picks are ranked by how confident the team is that the Over hits, not by payout.</li>
-          <li><b class="text-slate-300">Needs a free Gemini key</b> (Settings). It’s saved only in your browser, and each run uses 5 of your free requests.</li>
+          <li><b class="text-slate-300">Needs a free Gemini key</b> (Settings). It’s saved only in your browser, and each run uses 1 of your free requests.</li>
           <li><b class="text-slate-300">Games that have tipped off can’t be run.</b> DraftKings pulls the props at tip, so run in the afternoon.</li>
           <li>Rename the agents in <b class="text-slate-300">Settings</b> if you like. Research tool, not a guarantee.</li>
         </ul></div>` : ''}
-    ${AG.running || (Object.keys(AG.steps).length && !R && AG.lastGame===S.gameFilter) ? `<div class="flex flex-wrap gap-2 mt-4">${['recon','scout','quinn','vig','chief'].map(stepPill).join('')}</div>` : ''}
+    ${AG.running || (Object.keys(AG.steps).length && !R && AG.lastGame===S.gameFilter) ? `<div class="flex flex-wrap gap-2 mt-4">${['scout','quinn','vig','chief'].map(stepPill).join('')}</div>` : ''}
     ${AG.running && AG.status?`<div class="mt-3 text-xs font-mono text-slate-400">${esc(AG.status)}</div>`:''}
     ${AG.skipped?.length && AG.lastGame===S.gameFilter?`<div class="mt-2 text-[11px] text-yellow-300/80">Report missing this run: ${AG.skipped.map(esc).join('; ')}. ${esc(AG.names.chief)} decided with the others.</div>`:''}
-    ${AG.reconNote && AG.lastGame===S.gameFilter?`<div class="mt-2 text-[11px] text-yellow-300/80">Live search skipped (${esc(AG.reconNote)}). The team runs without it.</div>`:''}
     ${AG.error?`<div class="mt-3 text-sm text-red-400">${esc(AG.error)}</div>`:''}
     ${!gSel && !AG.running && !allRes.length ? `<div class="mt-3 text-xs text-slate-500">Pick a game from the menu above and tap Run to have the agent team break it down. ${AG.key?'':'Add your free Gemini key in Settings first (it stays in this browser only).'}</div>` : ''}
     ${gSel && !pre(gSel) && !R ? `<div class="mt-3 text-xs text-slate-500">${esc(gSel.short)} has started. The agents only run on games that haven't tipped off.</div>`:''}
