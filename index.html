@@ -107,7 +107,7 @@
 
   <footer class="text-center text-[11px] text-slate-600 py-6 leading-relaxed">
     Live data: ESPN public feeds (DraftKings is ESPN's odds provider). Not affiliated with DraftKings, ESPN or the NBA. Lines can move or be pulled at any time, so confirm in the DK app before betting.<br/>
-    For research and entertainment. Gambling problem? Call 1-800-GAMBLER. · <span class="font-mono">v2.8</span>
+    For research and entertainment. Gambling problem? Call 1-800-GAMBLER. · <span class="font-mono">v2.9</span>
   </footer>
 </main>
 
@@ -361,7 +361,7 @@ function parseBox(j, ev){
     const tstat = (j.boxscore.teams||[]).find(t=>t.team?.id===tp.team.id);
     const ts = Object.fromEntries((tstat?.statistics||[]).map(x=>[x.name, x.displayValue]));
     const [,fga] = sp(ts['fieldGoalsMade-fieldGoalsAttempted']), [,fta] = sp(ts['freeThrowsMade-freeThrowsAttempted']);
-    return { id: tp.team.id,
+    return { id: tp.team.id, st: (st.athletes||[]).filter(a=>a.starter).map(a=>a.athlete?.id).filter(Boolean),
       poss: fga + 0.44*fta - (+ts.offensiveRebounds||0) + (+ts.totalTurnovers || +ts.turnovers || 0),
       pl: (st.athletes||[]).map(a=>{
         const s = a.stats||[], min = parseFloat(s[ix('minutes')])||0, pos = posGroup(a.athlete?.position?.abbreviation);
@@ -386,7 +386,54 @@ async function loadBoxScores(){
     BOX.done++; if(BOX.done % 15 === 0) scheduleRender();
   })));
   computeMatchups(); BOX.status = 'ready'; scheduleRender();
+  loadLineups();
 }
+// ===== LINEUPS: confirmed starters once ESPN posts them, otherwise projected from each team's last game =====
+const LU = { status:'idle', teams:{} };   // teams[teamId] = { ids:[starters], conf:bool, lastDate, swaps:[{inId,outId}] }
+// re-check every 10 minutes so the board flips to Confirmed when ESPN posts starters (about 30 min before tip)
+setInterval(()=>{ if(BOX.status==='ready' && S.games.some(g=>!LU.teams[g.home.id]?.conf || !LU.teams[g.away.id]?.conf)) loadLineups(); }, 10*60*1000);
+function teamBoxGames(tid){ return Object.entries(BOX.games).filter(([,bx])=>bx.t.some(t=>t.id===tid)).sort((a,b)=>String(b[1].d).localeCompare(String(a[1].d))); }
+function startersFromSummary(j){
+  const out = {};
+  (j?.boxscore?.players||[]).forEach(tp=>{ const ids = (tp.statistics?.[0]?.athletes||[]).filter(a=>a.starter).map(a=>a.athlete?.id).filter(Boolean); if(tp.team?.id && ids.length>=5) out[tp.team.id] = ids.slice(0,5); });
+  return out;
+}
+async function loadLineups(){
+  if(LU.status==='loading') return; LU.status = 'loading';
+  await Promise.all(S.games.map(g => limit(async ()=>{
+    let conf = {};
+    try { conf = startersFromSummary(await getJSON(`${ESPN}/summary?event=${g.id}`)); } catch(e){}
+    for(const t of [g.away, g.home]){
+      if(conf[t.id]){ LU.teams[t.id] = { ids: conf[t.id], conf: true, swaps: [] }; continue; }
+      const games = teamBoxGames(t.id); if(!games.length) continue;
+      let [evId, bx] = games[0], me = bx.t.find(x=>x.id===t.id);
+      if(!me.st){   // box score cached before lineups existed: fetch that one game again
+        try { const nb = parseBox(await getJSON(`${ESPN}/summary?event=${evId}`), { date: bx.d }); if(nb){ BOX.games[evId] = nb; lsSet('dkat-bx-'+evId, nb); me = nb.t.find(x=>x.id===t.id); } } catch(e){}
+      }
+      LU.teams[t.id] = projectStarters(t.id, me?.st || [], games, bx.d);
+    }
+  })));
+  LU.status = 'ready'; scheduleRender();
+}
+function teamMinutes(tid, n=5){   // average minutes per player over the team's last n box scores
+  const M = {};
+  teamBoxGames(tid).slice(0, n).forEach(([,bx])=>{ const me = bx.t.find(x=>x.id===tid); (me?.pl||[]).forEach(pl=>{ const m = (M[pl[0]] ??= { sum:0, n:0, starts:0 }); m.sum += pl[2]||0; m.n++; if(me.st?.includes(pl[0])) m.starts++; }); });
+  for(const k in M) M[k].avg = M[k].sum / n;
+  return M;
+}
+function projectStarters(tid, last, games, lastDate){
+  const isOut = id => { const p = S.players[id]; return p && p.injury && /out/i.test(p.injury); };
+  const M = teamMinutes(tid, 10);
+  const ids = last.filter(id=>!isOut(id)), swaps = [];
+  for(const outId of last.filter(isOut)){
+    const pg = posGroup(S.players[outId]?.pos);
+    const pick = Object.keys(M).filter(id=>!ids.includes(id) && !last.includes(id) && !isOut(id) && S.players[id]?.teamId===tid)
+      .sort((a,b)=> (posGroup(S.players[b]?.pos)===pg) - (posGroup(S.players[a]?.pos)===pg) || M[b].starts - M[a].starts || M[b].avg - M[a].avg)[0];
+    if(pick){ ids.push(pick); swaps.push({ inId: pick, outId }); }
+  }
+  return { ids: ids.slice(0,5), conf: false, swaps, lastDate };
+}
+
 function computeMatchups(){
   const P = {}, PACE = {}, z = () => ({ pts:0, reb:0, ast:0, fg3:0 });
   for(const bx of Object.values(BOX.games)){
@@ -1873,7 +1920,50 @@ function renderMatchupBoard(){
         <div class="text-[10px] text-slate-600 mt-1">Score 0–100 blends defense vs his position, team defense and both teams' pace. It isn't a pick on its own.</div></div>` : ''}
     </div>`;
   };
-  el.innerHTML = head + `<div class="grid grid-cols-1 xl:grid-cols-2 gap-3 mt-4">${games.map(card).join('')}</div>`;
+  const bestProp = (id) => {   // his best matchup prop tonight (same score as Best matchup spots)
+    const P = S.props[id]; if(!P) return null; const p = S.players[id]; if(!p) return null;
+    let best = null;
+    for(const mk of MARKETS){ const m = P.markets[mk.key]; if(!m) continue; const mu = matchupFor(p, mk.key); if(mu.score==null) continue;
+      if(!best || mu.score > best.mu.score) best = { mk, m, mu }; }
+    if(!best) return null;
+    const L = S.logs[id], l10 = L?.status==='ok' ? L.games.slice(0,10) : [];
+    best.hit = l10.length ? l10.filter(x=>best.mk.f(x)>best.m.line).length + '/' + l10.length : '';
+    return best;
+  };
+  const row = (id, tag) => {
+    const p = S.players[id], b = bestProp(id); if(!p || !b) return '';
+    const sc = Math.round(b.mu.score*100);
+    return `<button data-mb="${id}:${b.mk.key}" title="${esc(p.pos||'')}${b.hit?' · cleared in '+b.hit+' of last games':''}" class="w-full text-left text-xs flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-slate-800/60">
+      <span class="font-mono font-bold w-7 shrink-0 ${sc>=60?'text-neon':sc>=40?'text-yellow-300':'text-red-400'}">${sc}</span>
+      <span class="font-semibold truncate min-w-0">${esc(p.name)}${tag||''}${p.injury?` <span class="text-[10px] text-yellow-300">${esc(p.injury)}</span>`:''}</span>
+      <span class="ml-auto pill pill-hit shrink-0" style="padding:1px 7px">O ${b.m.line} ${esc(b.mk.label)}</span>
+      <span class="text-slate-500 font-mono text-[10px] w-9 text-right shrink-0 hidden 2xl:inline">${b.hit||''}</span></button>`;
+  };
+  const lineupCol = (g, t) => {
+    const lu = LU.teams[t.id], M = teamMinutes(t.id, 5);
+    const isOut = p => p.injury && /out/i.test(p.injury);
+    const team = Object.values(S.players).filter(p=>p.teamId===t.id);
+    const starters = (lu?.ids||[]).filter(id=>S.players[id]);
+    const newIn = new Set((lu?.swaps||[]).map(x=>x.inId));
+    const startRows = starters.map(id=>row(id, newIn.has(id)?` <span class="text-[9px] font-bold px-1 rounded bg-neon/15 text-neon">NEW</span>`:'')).filter(Boolean);
+    const bench = team.filter(p=>!starters.includes(p.id) && !isOut(p) && S.props[p.id]).sort((a,b)=>(M[b.id]?.avg||0)-(M[a.id]?.avg||0)).map(p=>row(p.id)).filter(Boolean);
+    const outs = team.filter(p=>isOut(p) && ((M[p.id]?.avg||0)>=10 || (lu?.swaps||[]).some(x=>x.outId===p.id))).map(p=>esc(p.name));
+    const label = !lu ? (LU.status==='ready' ? 'No recent box score' : 'Loading…') : lu.conf ? '<span class="text-neon">Confirmed</span>' : 'Projected';
+    const swapNote = (lu?.swaps||[]).map(x=>`${esc(S.players[x.inId]?.name||'')} in for ${esc(S.players[x.outId]?.name||'')} (out)`).join(' · ');
+    return `<div class="min-w-0">
+      <div class="flex items-center gap-2 mb-1"><span class="font-extrabold">${esc(t.abbr)}</span><span class="text-[10px] uppercase tracking-wider text-slate-500">Starters · ${label}</span></div>
+      ${startRows.length ? `<div class="flex flex-col">${startRows.join('')}</div>` : `<div class="text-xs text-slate-500 px-2 py-1">${lu?'No starters with a DK prop yet.':'…'}</div>`}
+      ${swapNote ? `<div class="text-[10px] text-neon/80 px-2 mt-0.5">${swapNote}</div>` : ''}
+      ${bench.length ? `<div class="text-[10px] uppercase tracking-wider text-slate-500 mt-2 mb-1">Bench (by recent minutes)</div><div class="flex flex-col">${bench.join('')}</div>` : ''}
+      ${outs.length ? `<div class="text-[11px] text-slate-500 px-2 mt-2">Out: <span class="text-red-400/90">${outs.join(', ')}</span></div>` : ''}
+    </div>`;
+  };
+  const lineups = g => `<div class="rounded-xl border border-slate-700 bg-slate-900/50 p-4 min-w-0">
+      <div class="flex items-center gap-2 flex-wrap"><span class="font-extrabold">Lineups</span><span class="text-[11px] font-mono text-slate-500">${esc(g.away.abbr)} @ ${esc(g.home.abbr)} · each player's best matchup prop</span></div>
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-3">${[g.away, g.home].map(t=>lineupCol(g, t)).join('')}</div>
+      <div class="text-[10px] text-slate-600 mt-2">Projected = starters from each team's last game, with anyone ruled out swapped for the likeliest replacement. Switches to Confirmed when ESPN posts the starting fives. Only players with a DK prop are listed; tap one to open it.</div>
+    </div>`;
+  el.innerHTML = head + `<div class="grid grid-cols-1 xl:grid-cols-2 gap-3 mt-4">${games.map(g=>card(g)+lineups(g)).join('')}</div>`;
   wireMB(el);
 }
 function wireMB(el){
